@@ -1,0 +1,56 @@
+; eMMC (Exynos5420 dw_mmc0, v1awifi SM-P900) as a Storport disk, Windows RT 8.1.
+; Boot start: it can carry the Windows system disk.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosemmc.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = SCSIAdapter
+ClassGuid   = {4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider    = %Provider%
+DriverVer   = 10/31/2026,1.0.0.0
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosemmc.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5007
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosemmc.sys
+
+[Install.NT.Services]
+AddService = exynosemmc, 0x00000002, Service
+
+[Service]
+ServiceType    = 1              ; SERVICE_KERNEL_DRIVER
+StartType      = 0              ; SERVICE_BOOT_START: can carry the system disk
+ErrorControl   = 1
+ServiceBinary  = %12%\exynosemmc.sys
+LoadOrderGroup = SCSI miniport
+AddReg         = Service_AddReg
+
+[Service_AddReg]
+; Storport: this miniport handles PnP devices of interface type Internal (0),
+; PNPBus (15) and ACPIBus (17).
+HKR, "Parameters\PnpInterface", "0", 0x00010001, 0x00000001
+HKR, "Parameters\PnpInterface", "15", 0x00010001, 0x00000001
+HKR, "Parameters\PnpInterface", "17", 0x00010001, 0x00000001
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 eMMC (Storport)"

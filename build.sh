@@ -9,6 +9,7 @@
 # as Windows starts them:
 #   exynosdwc3  0x55534233 "USB3"     exynosi2c   0x49324321 "I2C!"
 #   exynosgpio  0x4750494F "GPIO"     mxt1664s    0x4D585421 "MXT!"
+#   wacomg9     0x57414321 "WAC!"     exynosemmc  0x454D4D43 "EMMC"
 set -e
 cd "$(dirname "$0")"
 
@@ -23,7 +24,12 @@ fi
 ./build-driver.sh mxt1664s mxt1664s/mxt1664s.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh wacomg9 wacomg9/wacomg9.c -- "$LIB/ntstrsafe.lib"
 
-for d in exynosdwc3 exynosi2c exynosgpio mxt1664s wacomg9; do
+# Storport miniport (not KMDF): the eMMC, MMC code built unchanged from the
+# UEFI tree (../uefi/Exynos5420Pkg/Drivers/SdCardDxe) against exynosemmc/MmcEnv.h.
+WDM=1 ./build-driver.sh exynosemmc exynosemmc/exynosemmc.c exynosemmc/mmccore.c exynosemmc/dwmci.c -- \
+  "$LIB/storport.lib" "$LIB/ntstrsafe.lib"
+
+for d in exynosdwc3 exynosi2c exynosgpio mxt1664s wacomg9 exynosemmc; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "$d/$d.inf" "Artifacts/$d/"
 done
