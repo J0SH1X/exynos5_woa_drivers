@@ -7,7 +7,8 @@
 # ARM, KMDF 1.13).  Drivers log to the OS log ring (common/oslog.h), streamed
 # over USB by exynosdwc3.  LOAD_TEST=1 builds load tests that bugcheck as soon
 # as Windows starts them:
-#   exynosdwc3  0x55534233 "USB3"
+#   exynosdwc3  0x55534233 "USB3"     exynosi2c   0x49324321 "I2C!"
+#   exynosgpio  0x4750494F "GPIO"     mxt1664s    0x4D585421 "MXT!"
 set -e
 cd "$(dirname "$0")"
 
@@ -17,8 +18,12 @@ if [ -n "$LOAD_TEST" ]; then
 fi
 
 ./build-driver.sh exynosdwc3 exynosdwc3/exynosdwc3.c -- "$LIB/ntstrsafe.lib"
+./build-driver.sh exynosi2c exynosi2c/exynosi2c.c -- "$LIB/spb/1.0/spbcxstubs.lib" "$LIB/ntstrsafe.lib"
+./build-driver.sh exynosgpio exynosgpio/exynosgpio.c -- "$LIB/msgpioclxstub.lib" "$LIB/ntstrsafe.lib"
+./build-driver.sh mxt1664s mxt1664s/mxt1664s.c -- "$LIB/ntstrsafe.lib"
+./build-driver.sh wacomg9 wacomg9/wacomg9.c -- "$LIB/ntstrsafe.lib"
 
-for d in exynosdwc3; do
+for d in exynosdwc3 exynosi2c exynosgpio mxt1664s wacomg9; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "$d/$d.inf" "Artifacts/$d/"
 done
