@@ -1,0 +1,94 @@
+; Exynos5420 audio (v1awifi, SM-P900), Windows RT 8.1: WM5102 codec on SPI2
+; (exynosspi) + I2S0, speakers / headphones (IDMA) and microphones (system
+; DMA), as a PortCls WaveRT device.  Needs exynosspi, exynosgpio and, for
+; capture, the halextpl330 HAL extension (NtHalExts).
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosaudio.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/02/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosaudio.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Audio, ACPI\EXYN500B
+
+[Audio.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
+CopyFiles = Files
+AddReg    = Audio.AddReg
+
+[Files]
+exynosaudio.sys
+
+[Audio.AddReg]
+HKR,,AssociatedFilters,,"wdmaud"
+HKR,,Driver,,exynosaudio.sys
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
+
+[Audio.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     Audio.I.Wave
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Wave%,     Audio.I.Wave
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_Wave%,     Audio.I.Wave
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,     Audio.I.Wave
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, Audio.I.Topology
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, Audio.I.Topology
+
+[Audio.I.Wave]
+AddReg = Audio.I.Wave.AddReg
+
+[Audio.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Wave.Name%
+
+[Audio.I.Topology]
+AddReg = Audio.I.Topology.AddReg
+
+[Audio.I.Topology.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Topology.Name%
+
+[Audio.NT.Services]
+AddService = exynosaudio, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosaudio.sys
+
+[Strings]
+Provider      = "Exynos5420"
+Mfg           = "Samsung"
+Disk          = "Exynos5420 drivers"
+DeviceDesc    = "WM5102 Audio (Exynos5420)"
+Wave.Name     = "Speakers (WM5102)"
+Topology.Name = "WM5102 Topology"
+
+KSNAME_Wave         = "Wave"
+KSNAME_Topology     = "Topology"
+KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER   = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"

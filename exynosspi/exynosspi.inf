@@ -1,0 +1,53 @@
+; Exynos5420 SPI controllers (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN500A s3c64xx-style SPI (SPI2: WM5102 codec).
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosspi.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 10/31/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosspi.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN500A
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosspi.sys
+
+[Install.NT.Services]
+AddService = exynosspi, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosspi.sys
+
+[Install.NT.Wdf]
+KmdfService = exynosspi, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 SPI controller"
