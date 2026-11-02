@@ -1,0 +1,54 @@
+; v1awifi (SM-P900) battery: MAX17050 fuel gauge + MAX77888 charger,
+; Windows RT 8.1.  A battery class (battc.sys) miniport; the composite
+; battery picks it up.  Also keeps the charger set for the attached cable.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosbatt.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Battery
+ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+Provider    = %Provider%
+DriverVer   = 11/01/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosbatt.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5008
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosbatt.sys
+
+[Install.NT.Services]
+AddService = exynosbatt, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosbatt.sys
+
+[Install.NT.Wdf]
+KmdfService = exynosbatt, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "SM-P900 battery (MAX17050 / MAX77888)"
