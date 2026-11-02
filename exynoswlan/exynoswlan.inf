@@ -1,0 +1,87 @@
+; v1awifi (SM-P900) Wi-Fi: Broadcom BCM4354 (FullMAC) on SDIO, Windows RT 8.1.
+; An NDIS 6.30 miniport that shows up as an Ethernet adapter for now: it
+; joins the network set under Device Manager > Advanced (Ssid, Passphrase;
+; WPA2-PSK, or open without a passphrase).
+;
+; The firmware files are Broadcom/Samsung blobs (from the stock Android
+; system: /system/etc/wifi/bcmdhd_sta.bin, nvram_net.txt_4354_a1 renamed to
+; nvram_net.txt) and are not part of the source tree: put them next to this
+; INF before adding the driver.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynoswlan.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/01/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynoswlan.sys = 1
+bcmdhd_sta.bin = 1
+nvram_net.txt  = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\VEN_EXYN&DEV_5009
+%DeviceDesc% = Install, ACPI\EXYN5009
+
+[Install.NT]
+Characteristics = 0x4                     ; NCF_PHYSICAL
+*IfType         = 6                       ; IF_TYPE_ETHERNET_CSMACD
+*MediaType      = 0                       ; NdisMedium802_3
+*PhysicalMediaType = 0                    ; NdisPhysicalMediumUnspecified
+*IfConnectorPresent = 1
+*ConnectionType = 1
+*DirectionType  = 0
+*AccessType     = 2
+*HardwareLoopback = 0
+CopyFiles       = Files
+AddReg          = Ndi_AddReg, Params_AddReg
+
+[Files]
+exynoswlan.sys
+bcmdhd_sta.bin
+nvram_net.txt
+
+[Ndi_AddReg]
+HKR, Ndi,            Service,    0, "exynoswlan"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
+[Params_AddReg]
+HKR, Ndi\Params\Ssid,       ParamDesc, 0, %SsidDesc%
+HKR, Ndi\Params\Ssid,       Type,      0, "edit"
+HKR, Ndi\Params\Ssid,       LimitText, 0, "32"
+HKR, Ndi\Params\Ssid,       Default,   0, ""
+HKR, Ndi\Params\Passphrase, ParamDesc, 0, %PassDesc%
+HKR, Ndi\Params\Passphrase, Type,      0, "edit"
+HKR, Ndi\Params\Passphrase, LimitText, 0, "64"
+HKR, Ndi\Params\Passphrase, Default,   0, ""
+
+[Install.NT.Services]
+AddService = exynoswlan, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynoswlan.sys
+LoadOrderGroup = NDIS
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Broadcom"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "BCM4354 Wi-Fi (SM-P900)"
+SsidDesc   = "Network name (SSID)"
+PassDesc   = "WPA2 passphrase (empty: open network)"
