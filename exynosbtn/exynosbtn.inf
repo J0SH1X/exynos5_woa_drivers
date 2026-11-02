@@ -1,0 +1,70 @@
+; v1awifi (SM-P900) hardware buttons (ACPI Windows Button Array, PNP0C40),
+; Windows RT 8.1: power, Windows (home), volume up / down.
+;
+; mshidkmdf.sys is the function driver (HID class); exynosbtn.sys is its lower
+; filter, with one GpioInt per key on exynosgpio.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosbtn.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %Provider%
+DriverVer   = 11/01/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosbtn.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\VEN_PNP&DEV_0C40
+%DeviceDesc% = Install, ACPI\PNP0C40
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosbtn.sys
+
+[Install.NT.HW]
+AddReg = Filter_AddReg
+
+[Filter_AddReg]
+HKR,,"LowerFilters",0x00010008,"exynosbtn"
+
+[Install.NT.Services]
+AddService = exynosbtn, , Filter_Service
+AddService = mshidkmdf, 0x00000002, mshidkmdf_Service
+
+[Filter_Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosbtn.sys
+
+[mshidkmdf_Service]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\mshidkmdf.sys
+
+[Install.NT.Wdf]
+KmdfService = exynosbtn, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "SM-P900 hardware buttons"
