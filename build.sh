@@ -54,6 +54,8 @@ WDM=1 ./build-driver.sh exynosaudio exynosaudio/adapter.cpp exynosaudio/wave.cpp
 WDM=1 ./build-driver.sh exynosemmc exynosemmc/exynosemmc.c exynosemmc/mmccore.c exynosemmc/dwmci.c -- \
   "$LIB/storport.lib" "$LIB/ntstrsafe.lib"
 
+SIGN=${SIGN:-$HOME/s2/winsdk/testsign/testsign}
+
 # Every build gets a new DriverVer (1.0.0.<build>, today's date) in the
 # Artifacts INFs, so Device Manager shows which test build is installed.
 BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
@@ -63,7 +65,17 @@ DATE=$(date +%m/%d/%Y)
 for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "Artifacts/$d/"
-  sed "s|^DriverVer *=.*|DriverVer   = $DATE,1.0.0.$BUILD|" "$d/$d.inf" > "Artifacts/$d/$d.inf"
+  sed -e "s|^DriverVer *=.*|DriverVer   = $DATE,1.0.0.$BUILD\nCatalogFile = $d.cat|" -e "/^CatalogFile/d" \
+    "$d/$d.inf" > "Artifacts/$d/$d.inf"
+  # Signed catalog over the INF and the driver (tools/mkcat.py), so pnputil /
+  # Device Manager accept the package once the test certificate is trusted.
+  if [ -f "$SIGN.key" ]; then
+    rm -f "Artifacts/$d/$d.cat"
+    python3 -I tools/mkcat.py "Artifacts/$d/$d.unsigned.cat" "Artifacts/$d/$d.inf" "Artifacts/$d/$d.sys" > /dev/null
+    osslsigncode sign -certs "$SIGN.crt" -key "$SIGN.key" -h sha256 \
+      -in "Artifacts/$d/$d.unsigned.cat" -out "Artifacts/$d/$d.cat" > /dev/null
+    rm -f "Artifacts/$d/$d.unsigned.cat"
+  fi
 done
 echo "DriverVer $DATE,1.0.0.$BUILD"
 echo "Artifacts/: $(ls Artifacts | tr '\n' ' ')"

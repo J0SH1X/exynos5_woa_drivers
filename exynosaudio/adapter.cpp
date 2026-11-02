@@ -225,7 +225,9 @@ AudioRenderStart (ULONG Physical, ULONG Bytes)
     }
   }
   KeReleaseMutex (&gAudio.Lock, FALSE);
-  OsLog ("exynosaudio: render start, buffer 0x%08lx + %lu bytes - 0x%08lx", Physical, Bytes, Status);
+  if (!NT_SUCCESS (Status)) {
+    OsLog ("exynosaudio: render start failed: 0x%08lx", Status);
+  }
   return Status;
 }
 
@@ -359,6 +361,24 @@ CodecIrqDisconnect (VOID)
 // ---------------------------------------------------------------------------
 //
 
+static VOID
+LogResources (PCSTR Which, PCM_RESOURCE_LIST List)
+{
+  PCM_PARTIAL_RESOURCE_DESCRIPTOR  Desc;
+  ULONG                            Index;
+
+  if ((List == NULL) || (List->Count == 0)) {
+    OsLog ("exynosaudio: %s resources: none", Which);
+    return;
+  }
+  for (Index = 0; Index < List->List[0].PartialResourceList.Count; Index++) {
+    Desc = &List->List[0].PartialResourceList.PartialDescriptors[Index];
+    OsLog ("exynosaudio: %s resource %lu: type %u flags 0x%04x data %08lx %08lx %08lx", Which, Index,
+           (ULONG)Desc->Type, (ULONG)Desc->Flags, Desc->u.Generic.Start.LowPart,
+           Desc->u.Generic.Start.HighPart, Desc->u.Generic.Length);
+  }
+}
+
 static NTSTATUS
 CaptureDmaOpen (PRESOURCELIST Resources)
 {
@@ -370,6 +390,8 @@ CaptureDmaOpen (PRESOURCELIST Resources)
   Desc = Resources->FindTranslatedEntry (CmResourceTypeDma, 0);
   if ((Desc == NULL) || ((Desc->Flags & CM_RESOURCE_DMA_V3) == 0)) {
     OsLog ("exynosaudio: no FixedDMA resource: no capture");
+    LogResources ("raw", Resources->UntranslatedList ());
+    LogResources ("translated", Resources->TranslatedList ());
     return STATUS_DEVICE_CONFIGURATION_ERROR;
   }
   gAudio.DmaRequestLine = Desc->u.DmaV3.RequestLine;
@@ -448,8 +470,6 @@ AudioCaptureStart (PMDL Mdl, ULONG Bytes)
   gAudio.CaptureMdl = Mdl;
   gAudio.Capturing  = TRUE;
   KeReleaseMutex (&gAudio.Lock, FALSE);
-  OsLog ("exynosaudio: capture start (%s mic), %lu bytes", gAudio.Codec.HeadsetMic ? "headset" : "main",
-         gAudio.CaptureBytes);
   return STATUS_SUCCESS;
 
 Fail:

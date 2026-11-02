@@ -384,7 +384,6 @@ CMiniportWaveRTStream::AllocateAudioBuffer (_In_ ULONG RequestedSize, _Out_ PMDL
   *ActualSize          = Bytes;
   *OffsetFromFirstPage = 0;
   *CacheType           = MmWriteCombined;
-  OsLog ("exynosaudio: buffer %lu bytes (requested %lu) at 0x%08lx", Bytes, RequestedSize, m_Physical);
   return STATUS_SUCCESS;
 }
 
