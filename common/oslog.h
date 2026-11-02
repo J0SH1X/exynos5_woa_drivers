@@ -59,7 +59,7 @@ OsLogInit (VOID)
   PHYSICAL_ADDRESS  Base;
 
   Base.QuadPart = OS_LOG_BASE;
-  mOsLog = MmMapIoSpace (Base, OS_LOG_SIZE, MmNonCached);
+  mOsLog = (volatile OS_LOG_RING *)MmMapIoSpace (Base, OS_LOG_SIZE, MmNonCached);
 }
 
 static __inline VOID

@@ -40,10 +40,16 @@ CFLAGS="--target=thumbv7-pc-windows-msvc -fms-extensions -fms-compatibility
   -DNTDDI_VERSION=0x06030000 -D_WIN32_WINNT=0x0603 -DWINVER=0x0603
   -DKMDF_VERSION_MAJOR=1 -DKMDF_VERSION_MINOR=13 $EXTRA_CFLAGS"
 
+# .cpp sources (PortCls miniports) as C++ without exceptions, RTTI or
+# thread-safe statics; everything else as C.
+CXXFLAGS="-x c++ -std=c++14 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wno-unused-private-field -Wno-missing-braces"
+
 OBJS=""
 for s in $SRCS; do
-  o="$OUT/$(basename "${s%.c}").obj"
-  clang $CFLAGS -c "$s" -o "$o"
+  case "$s" in
+    *.cpp) o="$OUT/$(basename "${s%.cpp}").obj"; clang $CFLAGS $CXXFLAGS -c "$s" -o "$o" ;;
+    *)     o="$OUT/$(basename "${s%.c}").obj";   clang $CFLAGS -c "$s" -o "$o" ;;
+  esac
   OBJS="$OBJS $o"
 done
 

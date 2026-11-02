@@ -10,6 +10,7 @@
 #   exynosdwc3  0x55534233 "USB3"     exynosi2c   0x49324321 "I2C!"
 #   exynosgpio  0x4750494F "GPIO"     mxt1664s    0x4D585421 "MXT!"
 #   wacomg9     0x57414321 "WAC!"     exynosemmc  0x454D4D43 "EMMC"
+#   (exynosbatt has no load test)
 set -e
 cd "$(dirname "$0")"
 
@@ -21,16 +22,48 @@ fi
 ./build-driver.sh exynosdwc3 exynosdwc3/exynosdwc3.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh exynosi2c exynosi2c/exynosi2c.c -- "$LIB/spb/1.0/spbcxstubs.lib" "$LIB/ntstrsafe.lib"
 ./build-driver.sh exynosgpio exynosgpio/exynosgpio.c -- "$LIB/msgpioclxstub.lib" "$LIB/ntstrsafe.lib"
+# SPI controllers (SpbCx); the controller code is UEFI's SpiDxe/SpiCore.c.
+./build-driver.sh exynosspi exynosspi/exynosspi.c exynosspi/spicore.c -- "$LIB/spb/1.0/spbcxstubs.lib" "$LIB/ntstrsafe.lib"
 ./build-driver.sh mxt1664s mxt1664s/mxt1664s.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh wacomg9 wacomg9/wacomg9.c -- "$LIB/ntstrsafe.lib"
+./build-driver.sh exynosbtn exynosbtn/exynosbtn.c -- "$LIB/ntstrsafe.lib"
+# Battery class miniport; the gauge / charger code and the bit-banged I2C are
+# built unchanged from the UEFI tree (exynosbatt/ExynosEnv.h).
+./build-driver.sh exynosbatt exynosbatt/exynosbatt.c exynosbatt/batterycore.c exynosbatt/gpioi2c.c -- \
+  "$LIB/battc.lib" "$LIB/ntstrsafe.lib"
+
+# NDIS miniport (not KMDF): Wi-Fi.  The Broadcom core and the MMC host come
+# from the UEFI tree (exynoswlan/MmcEnv.h).  ndis.h's NDIS_API_VERSION_AVAILABLE
+# pastes 0x onto macro arguments without expanding them (MSVC preprocessor
+# behaviour); a patched copy with the usual two-level macro goes into
+# exynoswlan/build/ndisfix (generated, not in git).
+NDISFIX=exynoswlan/build/ndisfix
+mkdir -p "$NDISFIX"
+sed -e 's/^#define NDIS_API_VERSION_AVAILABLE(major,minor) \(.*\)$/#define NDIS_API_VERSION_AVAILABLE_(major,minor) \1\n#define NDIS_API_VERSION_AVAILABLE(major,minor) NDIS_API_VERSION_AVAILABLE_(major,minor)/' \
+  "${WDK:-$HOME/s2/winsdk/wdk10}/Include/10.0.19041.0/km/ndis.h" > "$NDISFIX/ndis.h"
+EXTRA_CFLAGS="$EXTRA_CFLAGS -I$NDISFIX -Wno-extra-tokens" WDM=1 ./build-driver.sh exynoswlan exynoswlan/exynoswlan.c exynoswlan/bcmsdio.c exynoswlan/bcmwpa.c exynoswlan/dwmci.c -- \
+  "$LIB/ndis.lib" "$LIB/ntstrsafe.lib"
+
+# PortCls WaveRT miniport (WDM, C++): speakers.  The codec / I2S cores come
+# from the UEFI tree (Drivers/Audio), the board through exynosspi / exynosgpio.
+WDM=1 ./build-driver.sh exynosaudio exynosaudio/adapter.cpp exynosaudio/wave.cpp exynosaudio/topo.cpp \
+  exynosaudio/guids.cpp exynosaudio/cores.c -- "$LIB/portcls.lib" "$LIB/stdunk.lib" "$LIB/ntstrsafe.lib"
 
 # Storport miniport (not KMDF): the eMMC, MMC code built unchanged from the
 # UEFI tree (../uefi/Exynos5420Pkg/Drivers/SdCardDxe) against exynosemmc/MmcEnv.h.
 WDM=1 ./build-driver.sh exynosemmc exynosemmc/exynosemmc.c exynosemmc/mmccore.c exynosemmc/dwmci.c -- \
   "$LIB/storport.lib" "$LIB/ntstrsafe.lib"
 
-for d in exynosdwc3 exynosi2c exynosgpio mxt1664s wacomg9 exynosemmc; do
+# Every build gets a new DriverVer (1.0.0.<build>, today's date) in the
+# Artifacts INFs, so Device Manager shows which test build is installed.
+BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
+echo "$BUILD" > .buildnum
+DATE=$(date +%m/%d/%Y)
+
+for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc; do
   mkdir -p "Artifacts/$d"
-  cp "$d/build/$d.sys" "$d/$d.inf" "Artifacts/$d/"
+  cp "$d/build/$d.sys" "Artifacts/$d/"
+  sed "s|^DriverVer *=.*|DriverVer   = $DATE,1.0.0.$BUILD|" "$d/$d.inf" > "Artifacts/$d/$d.inf"
 done
+echo "DriverVer $DATE,1.0.0.$BUILD"
 echo "Artifacts/: $(ls Artifacts | tr '\n' ' ')"
