@@ -27,6 +27,11 @@ fi
 ./build-driver.sh mxt1664s mxt1664s/mxt1664s.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh wacomg9 wacomg9/wacomg9.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh exynosbtn exynosbtn/exynosbtn.c -- "$LIB/ntstrsafe.lib"
+# Sensors on I2C3, one HID sensor minidriver each (common/hidsensor.h,
+# common/spbreg.h) under mshidkmdf.
+for s in bma255 bmg160 ak8963 cm3323; do
+  ./build-driver.sh $s $s/$s.c -- "$LIB/ntstrsafe.lib"
+done
 # Battery class miniport; the gauge / charger code and the bit-banged I2C are
 # built unchanged from the UEFI tree (exynosbatt/ExynosEnv.h).
 ./build-driver.sh exynosbatt exynosbatt/exynosbatt.c exynosbatt/batterycore.c exynosbatt/gpioi2c.c -- \
@@ -62,7 +67,7 @@ BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
 echo "$BUILD" > .buildnum
 DATE=$(date +%m/%d/%Y)
 
-for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc; do
+for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc bma255 bmg160 ak8963 cm3323; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "Artifacts/$d/"
   sed -e "s|^DriverVer *=.*|DriverVer   = $DATE,1.0.0.$BUILD\nCatalogFile = $d.cat|" -e "/^CatalogFile/d" \

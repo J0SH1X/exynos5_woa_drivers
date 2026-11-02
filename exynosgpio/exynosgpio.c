@@ -23,6 +23,12 @@
                        GPJ4(0) = pin 48
     bank 7  pins 56-63 GPY7 (RT controller), I/O only: mic bias enable =
                        GPY7(6) = pin 62
+    bank 8  pins 64-71 GPX0 through combiner group 24 (EINT1; GSI 56):
+                       hall / cover = GPX0(1) = pin 65
+    bank 9  pins 72-79 GPX1 through combiner group 29 (EINT10, 11; GSI 61):
+                       accelerometer INT1 = GPX1(3) = pin 75
+    bank 10 pins 80-87 GPX1 through combiner group 31 (EINT14, 15; GSI 63):
+                       accelerometer INT2 = GPX1(7) = pin 87
   GpioClx binds one interrupt resource to each bank, in order, so the
   I/O-only banks get a Shared copy of bank 0's line (GSI 110) in ACPI; they
   never enable a pin, so they never claim it.
@@ -55,7 +61,7 @@
 #define GPIO_BUGCHECK  0x4750494F
 
 #define PINS_PER_BANK  8
-#define BANKS          8
+#define BANKS          11
 #define LB             0x80000000u   // register offset flag: in the LB controller mapping
 
 #define FUNC_INPUT   0x0
@@ -98,6 +104,14 @@ static const BANK mBanks[BANKS] = {
   { "GPG0", LB | 0x080, LB | 0x084, LB | 0x088, 0, 0, 0, 0, 0, { 0 } },
   { "GPJ4", LB | 0x0E0, LB | 0x0E4, LB | 0x0E8, 0, 0, 0, 0, 0, { 0 } },
   { "GPY7", 0x00000, 0x00004, 0x00008, 0, 0, 0, 0, 0, { 0 } },
+  //
+  // More EINT0-15 lines through the combiner (sensors, cover): group 24
+  // (EINT1, set +0x60 bits 0-1), groups 29 and 31 (EINT10-11 / 14-15, set
+  // +0x70 bits 8-9 / 24-25).
+  //
+  { "GPX0/24", 0x00C00, 0x00C04, 0x00C08, 0x00E00, 0x00F00, 0x00F40, 0x02, 0x60, { 0, 0, 0, 0, 0, 0, 0, 0 } },   // EINT1 = combiner 24 input 0
+  { "GPX1/29", 0x00C20, 0x00C24, 0x00C28, 0x00E04, 0x00F04, 0x00F44, 0x0C, 0x70, { 0, 0, 8, 9, 0, 0, 0, 0 } },
+  { "GPX1/31", 0x00C20, 0x00C24, 0x00C28, 0x00E04, 0x00F04, 0x00F44, 0xC0, 0x70, { 0, 0, 0, 0, 0, 0, 24, 25 } },
 };
 
 #define COMBINER_ENABLE_SET    0x0
@@ -497,6 +511,14 @@ GpioConnectIoPins (PVOID Context, PGPIO_CONNECT_IO_PINS_PARAMETERS Params)
   Func = (Params->ConnectMode == ConnectModeOutput) ? FUNC_OUTPUT : FUNC_INPUT;
   for (Index = 0; Index < Params->PinCount; Index++) {
     Pin = Params->PinNumberTable[Index];
+    //
+    // A pin in EINT mode (an interrupt connected on it, e.g. the cover's
+    // _AEI) stays there for an input connection (the lid's _LID reads it
+    // through the GPIO operation region): DAT still shows its level.
+    //
+    if ((Func == FUNC_INPUT) && (((RegRead (Ctx, Bank->Con) >> (Pin * 4)) & 0xF) == FUNC_INT)) {
+      continue;
+    }
     RegField (Ctx, Bank->Pud, Pin * 2, 2, PullValue (Params->PullConfiguration));
     RegField (Ctx, Bank->Con, Pin * 4, 4, Func);
   }
@@ -514,7 +536,9 @@ GpioDisconnectIoPins (PVOID Context, PGPIO_DISCONNECT_IO_PINS_PARAMETERS Params)
   Bank = BankOf (Params->BankId);
   if (Params->DisconnectFlags.PreserveConfiguration == 0) {
     for (Index = 0; Index < Params->PinCount; Index++) {
-      RegField (Ctx, Bank->Con, Params->PinNumberTable[Index] * 4, 4, FUNC_INPUT);
+      if (((RegRead (Ctx, Bank->Con) >> (Params->PinNumberTable[Index] * 4)) & 0xF) != FUNC_INT) {
+        RegField (Ctx, Bank->Con, Params->PinNumberTable[Index] * 4, 4, FUNC_INPUT);
+      }
     }
   }
   return STATUS_SUCCESS;
