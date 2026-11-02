@@ -1,0 +1,51 @@
+; v1awifi internal display (Samsung LSL122DL01 eDP panel on FIMD1 + DP1,
+; LP8556 backlight), WDDM 1.2 display-only driver, Windows RT 8.1.
+;
+; The driver brings the panel up from cold (panel power cycle, DP link
+; training, FIMD1, backlight), supports rotation and the brightness
+; interface.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/02/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosdisp.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5010
+
+[Install.NT]
+CopyFiles = Files
+FeatureScore = F8
+
+[Files]
+exynosdisp.sys
+
+[Install.NT.Services]
+AddService = exynosdisp, 0x00000002, Service
+
+[Service]
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 0
+ServiceBinary  = %12%\exynosdisp.sys
+LoadOrderGroup = Video
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5420 FIMD / eDP display (LSL122DL01)"

@@ -27,6 +27,11 @@ fi
 ./build-driver.sh mxt1664s mxt1664s/mxt1664s.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh wacomg9 wacomg9/wacomg9.c -- "$LIB/ntstrsafe.lib"
 ./build-driver.sh exynosbtn exynosbtn/exynosbtn.c -- "$LIB/ntstrsafe.lib"
+# Display-only WDDM 1.2 driver (KMDOD) for the internal panel; the display
+# cores and the bit-banged I2C come from the UEFI tree (exynosdisp/cores.c).
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E" WDM=1 ./build-driver.sh exynosdisp \
+  exynosdisp/exynosdisp.c exynosdisp/cores.c -- "$LIB/displib.lib" "$LIB/ntstrsafe.lib"
+
 # Sensors on I2C3, one HID sensor minidriver each (common/hidsensor.h,
 # common/spbreg.h) under mshidkmdf.
 for s in bma255 bmg160 ak8963 cm3323; do
@@ -67,7 +72,7 @@ BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
 echo "$BUILD" > .buildnum
 DATE=$(date +%m/%d/%Y)
 
-for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc bma255 bmg160 ak8963 cm3323; do
+for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynosemmc bma255 bmg160 ak8963 cm3323 exynosdisp; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "Artifacts/$d/"
   sed -e "s|^DriverVer *=.*|DriverVer   = $DATE,1.0.0.$BUILD\nCatalogFile = $d.cat|" -e "/^CatalogFile/d" \
