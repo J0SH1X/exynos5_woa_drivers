@@ -72,6 +72,8 @@ typedef struct {
   BOOLEAN     WorkerQueued;
   ULONG       Commands;       // SCSI commands seen (logging)
   ULONG       Transfers;      // reads/writes done (logging)
+  ULONG       Recoveries;     // card re-initialisations after a dropout
+  LONGLONG    LastRecovery;   // KeQueryInterruptTime() of the last one
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 static VOID
@@ -172,6 +174,35 @@ ScsiModeSense (PSCSI_REQUEST_BLOCK Srb, BOOLEAN Ten)
   return CopyOut (Srb, Header, 4);
 }
 
+/**
+  The card sometimes stops answering mid-session (every command, CMD13
+  included, times out: it has lost its RCA, as after a reset).  Bring it
+  back like at boot: controller FIFO / DMA reset, 400 kHz 1-bit, then the
+  whole identification sequence.  At most every 2 s.
+**/
+static BOOLEAN
+RecoverCard (PDEVICE_EXTENSION Dev)
+{
+  LONGLONG    Now;
+  EFI_STATUS  Status;
+
+  Now = (LONGLONG)KeQueryInterruptTime ();
+  if ((Dev->LastRecovery != 0) && (Now - Dev->LastRecovery < 20000000LL)) {
+    return FALSE;
+  }
+  Dev->LastRecovery = Now;
+  Dev->Recoveries++;
+
+  WRITE_REGISTER_ULONG ((PULONG)(Dev->Base + 0x00), READ_REGISTER_ULONG ((PULONG)(Dev->Base + 0x00)) | 0x6);
+  KeStallExecutionProcessor (100);
+  Dev->Host.SetBusWidth (&Dev->Host, 1);
+  Dev->Host.SetClock (&Dev->Host, 400000);
+  Status = MmcInitCard (&Dev->Host, TRUE);
+  OsLog ("exynosemmc: card stopped answering, re-init #%lu - 0x%08Ix (%lu-bit)", Dev->Recoveries, Status,
+         Dev->Host.Card.BusWidth);
+  return !EFI_ERROR (Status);
+}
+
 static UCHAR
 ScsiReadWrite (PDEVICE_EXTENSION Dev, PSCSI_REQUEST_BLOCK Srb, BOOLEAN Write, UINT64 Lba, ULONG Blocks)
 {
@@ -187,6 +218,11 @@ ScsiReadWrite (PDEVICE_EXTENSION Dev, PSCSI_REQUEST_BLOCK Srb, BOOLEAN Write, UI
 
   Status = Write ? MmcWriteBlocks (&Dev->Host, Lba, Blocks, Srb->DataBuffer)
                  : MmcReadBlocks (&Dev->Host, Lba, Blocks, Srb->DataBuffer);
+  if ((Status == EFI_TIMEOUT) && RecoverCard (Dev)) {
+    Status = Write ? MmcWriteBlocks (&Dev->Host, Lba, Blocks, Srb->DataBuffer)
+                   : MmcReadBlocks (&Dev->Host, Lba, Blocks, Srb->DataBuffer);
+    OsLog ("exynosemmc: retry after re-init: %s LBA %I64u x%lu - 0x%08Ix", Write ? "write" : "read", Lba, Blocks, Status);
+  }
   if (EFI_ERROR (Status)) {
     OsLog ("exynosemmc: %s LBA %I64u x%lu failed 0x%08Ix", Write ? "write" : "read", Lba, Blocks, Status);
     return SRB_STATUS_ERROR;
