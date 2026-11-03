@@ -15,6 +15,17 @@
   to 10 contacts.  UEFI powers the controller (MAX77802 LDO29, TOUCH_EN /
   EN_1 / RESET) and leaves it on.
 
+  Touch keys (Back / Menu below the panel) are the controller's T15 key
+  array: bit 1 Back, bit 4 Menu, bits 0 / 2 / 3 / 5 dummy nodes (mxts.c,
+  board-vienna-input.c).  They go to Windows as a second top-level
+  collection, a keyboard: Menu sends Ctrl+Win+Tab (the app list, kept
+  open) on a short press and Win+C (charms) when held; Back sends Win+D
+  (desktop) on a short press and Win+Tab (previous app) when held.  As mxts.c, a touched dummy
+  node next to a key (d_back / d_menu) suppresses that key (palm on the
+  bezel).  The key backlight is MAX77802 LDO23 ("key_led_3.3v", 2.5-3.3 V)
+  on the PMIC's I2C (second I2cSerialBus resource, optional): on at 3.0 V
+  when a key is touched, off KEY_LED_TIMEOUT_MS after the last key touch.
+
   Progress and failures (step MXT_STEP_*, status) go to the OS log ring and
   from there over USB (exynosusb); a failed bring-up fails the device.
   Built with LOAD_TEST=1 it bugchecks 0x4D585421 ("MXT!") in PrepareHardware
@@ -51,6 +62,7 @@ enum {
 //
 #define MXT_GEN_MESSAGEPROCESSOR_T5    5
 #define MXT_TOUCH_MULTITOUCHSCREEN_T9  9
+#define MXT_TOUCH_KEYARRAY_T15         15
 #define MXT_TOUCH_MULTITOUCHSCREEN_T100  100
 
 //
@@ -77,11 +89,42 @@ enum {
 #define MAX_CONTACTS  10
 
 //
+// T15 message: [1] status (bit 7 detect), [2] key bits.
+//
+#define MXT_T15_DETECT       0x80
+#define KEY_D_BACK           (1u << 0)
+#define KEY_BACK             (1u << 1)
+#define KEY_MENU             (1u << 4)
+#define KEY_D_MENU           (1u << 5)
+#define LONG_PRESS_MS        600
+
+//
+// HID keyboard usages.
+//
+#define MOD_LCTRL            0x01
+#define MOD_LGUI             0x08
+#define USAGE_C              0x06
+#define USAGE_D              0x07
+#define USAGE_TAB            0x2B
+
+//
+// Key backlight: MAX77802 LDO23 CTRL1 (0x60 + 22): [7:6] mode (3 = on),
+// [5:0] voltage, 800 mV + 50 mV steps (P-channel LDO).
+//
+#define PMIC_LDO23_CTRL1     0x76
+#define KEY_LED_CODE         ((3000 - 800) / 50)   // 3.0 V, mxts.c BL_STANDARD
+#define KEY_LED_ON           (0xC0 | KEY_LED_CODE)
+#define KEY_LED_OFF          (KEY_LED_CODE)
+#define KEY_LED_TIMEOUT_MS   3000
+#define KEY_RING             8
+
+//
 // HID: one input report (ID 1) with all contacts, and the Contact Count
 // Maximum feature (ID 2) Windows 8 requires.
 //
 #define REPORTID_TOUCH     1
 #define REPORTID_MAXCOUNT  2
+#define REPORTID_KEYBOARD  3
 
 #include <pshpack1.h>
 typedef struct {
@@ -101,6 +144,13 @@ typedef struct {
   UCHAR  ReportId;
   UCHAR  MaxCount;
 } HID_MAXCOUNT_REPORT;
+
+typedef struct {
+  UCHAR  ReportId;
+  UCHAR  Modifiers;
+  UCHAR  Reserved;
+  UCHAR  Keys[6];
+} HID_KEYBOARD_REPORT;
 #include <poppack.h>
 
 //
@@ -158,6 +208,31 @@ static UCHAR mReportDescriptor[] = {
   0x09, 0x55,                      //   Usage (Contact Count Maximum)
   0x25, MAX_CONTACTS,              //   Logical Maximum
   0xB1, 0x02,                      //   Feature (Data,Var,Abs)
+  0xC0,                            // End Collection
+  //
+  // Touch keys as a keyboard (boot-keyboard layout).
+  //
+  0x05, 0x01,                      // Usage Page (Generic Desktop)
+  0x09, 0x06,                      // Usage (Keyboard)
+  0xA1, 0x01,                      // Collection (Application)
+  0x85, REPORTID_KEYBOARD,         //   Report ID
+  0x05, 0x07,                      //   Usage Page (Keyboard)
+  0x19, 0xE0,                      //   Usage Minimum (Left Control)
+  0x29, 0xE7,                      //   Usage Maximum (Right GUI)
+  0x15, 0x00,                      //   Logical Minimum (0)
+  0x25, 0x01,                      //   Logical Maximum (1)
+  0x75, 0x01,                      //   Report Size (1)
+  0x95, 0x08,                      //   Report Count (8)
+  0x81, 0x02,                      //   Input (Data,Var,Abs)
+  0x75, 0x08,                      //   Report Size (8)
+  0x95, 0x01,                      //   Report Count (1)
+  0x81, 0x03,                      //   Input (Cnst,Var,Abs)
+  0x95, 0x06,                      //   Report Count (6)
+  0x15, 0x00,                      //   Logical Minimum (0)
+  0x25, 0x65,                      //   Logical Maximum (101)
+  0x19, 0x00,                      //   Usage Minimum (0)
+  0x29, 0x65,                      //   Usage Maximum (101)
+  0x81, 0x00,                      //   Input (Data,Array,Abs)
   0xC0                             // End Collection
 };
 
@@ -193,6 +268,25 @@ typedef struct {
   UCHAR         XDropBits;
   UCHAR         YDropBits;
 
+  UCHAR         KeyFirstReport;    // T15 report IDs (0: no key array)
+  UCHAR         KeyReports;
+  UCHAR         KeyState;          // last T15 key bits
+  BOOLEAN       IgnoreMenu;        // d_menu touched first
+  BOOLEAN       IgnoreBack;        // d_back touched first
+  BOOLEAN       MenuHeld;          // menu down, long press not yet sent
+  WDFTIMER      MenuTimer;         // long press
+  BOOLEAN       BackHeld;
+  WDFTIMER      BackTimer;
+  WDFSPINLOCK   KeyLock;           // KeyRing and the report queue
+  HID_KEYBOARD_REPORT  KeyRing[KEY_RING];   // key reports waiting for a read
+  ULONG         KeyHead;
+  ULONG         KeyCount;
+
+  WDFIOTARGET   Pmic;              // MAX77802 (optional)
+  LARGE_INTEGER PmicConnection;
+  BOOLEAN       KeyLed;
+  WDFTIMER      LedTimer;          // backlight off after inactivity
+
   FINGER_STATE  Fingers[MAX_CONTACTS];
   BOOLEAN       Reported;
   ULONG         Delivered;         // reports handed to HID class
@@ -207,6 +301,9 @@ EVT_WDF_DRIVER_DEVICE_ADD               EvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE         EvtPrepareHardware;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL EvtInternalDeviceControl;
 EVT_WDF_INTERRUPT_ISR                   EvtInterruptIsr;
+EVT_WDF_TIMER                           EvtMenuTimer;
+EVT_WDF_TIMER                           EvtBackTimer;
+EVT_WDF_TIMER                           EvtLedTimer;
 
 static NTSTATUS
 BringUpFailed (ULONG Step, NTSTATUS Status)
@@ -287,6 +384,9 @@ MxtProbe (PDEVICE_CONTEXT Ctx)
       T9Addr    = Obj[1] | (Obj[2] << 8);
       T9Report  = ReportId;
       T9Reports = Obj[5];
+    } else if (Obj[0] == MXT_TOUCH_KEYARRAY_T15) {
+      Ctx->KeyFirstReport = ReportId;
+      Ctx->KeyReports     = (UCHAR)(Obj[5] * (Obj[4] + 1));
     } else if (Obj[0] == MXT_TOUCH_MULTITOUCHSCREEN_T100) {
       T100Addr    = Obj[1] | (Obj[2] << 8);
       T100Report  = ReportId;
@@ -342,9 +442,9 @@ MxtProbe (PDEVICE_CONTEXT Ctx)
   if (Ctx->YRange == 0) {
     Ctx->YRange = 4095;
   }
-  OsLog ("mxt1664s: T5 @0x%x (%u bytes), %s, contacts from report %u (%u)",
+  OsLog ("mxt1664s: T5 @0x%x (%u bytes), %s, contacts from report %u (%u), T15 keys from report %u (%u)",
          Ctx->MsgAddr, Ctx->MsgSize, Ctx->IsT100 ? "T100" : "T9",
-         Ctx->TouchFirstReport, Ctx->TouchReports);
+         Ctx->TouchFirstReport, Ctx->TouchReports, Ctx->KeyFirstReport, Ctx->KeyReports);
   return STATUS_SUCCESS;
 }
 
@@ -367,12 +467,185 @@ FixupReportDescriptor (PDEVICE_CONTEXT Ctx)
   }
 }
 
+/**
+  Key backlight on / off (LDO23); on restarts the inactivity timer.
+  Passive level (ISR, passive timer).
+**/
+static VOID
+KeyLedActivity (PDEVICE_CONTEXT Ctx, BOOLEAN On)
+{
+  UCHAR                  Buf[2];
+  WDF_MEMORY_DESCRIPTOR  Input;
+  ULONG_PTR              Bytes;
+  NTSTATUS               Status;
+
+  if (Ctx->Pmic == NULL) {
+    return;
+  }
+  if (On) {
+    WdfTimerStart (Ctx->LedTimer, WDF_REL_TIMEOUT_IN_MS (KEY_LED_TIMEOUT_MS));
+  }
+  if (On == Ctx->KeyLed) {
+    return;
+  }
+  Buf[0] = PMIC_LDO23_CTRL1;
+  Buf[1] = On ? KEY_LED_ON : KEY_LED_OFF;
+  WDF_MEMORY_DESCRIPTOR_INIT_BUFFER (&Input, Buf, sizeof (Buf));
+  Status = WdfIoTargetSendWriteSynchronously (Ctx->Pmic, NULL, &Input, NULL, NULL, &Bytes);
+  if (NT_SUCCESS (Status)) {
+    Ctx->KeyLed = On;
+  } else {
+    OsLog ("mxt1664s: key backlight %s failed: 0x%08lx", On ? "on" : "off", Status);
+  }
+}
+
+/**
+  One keyboard report to HID class: straight into a pending read, or into
+  the ring until the next read arrives (key presses are never dropped).
+**/
+static VOID
+QueueKeyReport (PDEVICE_CONTEXT Ctx, UCHAR Modifiers, UCHAR Key)
+{
+  HID_KEYBOARD_REPORT  Report;
+  WDFREQUEST           Request;
+  WDFMEMORY            Memory;
+
+  RtlZeroMemory (&Report, sizeof (Report));
+  Report.ReportId  = REPORTID_KEYBOARD;
+  Report.Modifiers = Modifiers;
+  Report.Keys[0]   = Key;
+
+  WdfSpinLockAcquire (Ctx->KeyLock);
+  if ((Ctx->KeyCount == 0) && NT_SUCCESS (WdfIoQueueRetrieveNextRequest (Ctx->ReportQueue, &Request))) {
+    WdfSpinLockRelease (Ctx->KeyLock);
+    if (NT_SUCCESS (WdfRequestRetrieveOutputMemory (Request, &Memory)) &&
+        NT_SUCCESS (WdfMemoryCopyFromBuffer (Memory, 0, &Report, sizeof (Report)))) {
+      WdfRequestCompleteWithInformation (Request, STATUS_SUCCESS, sizeof (Report));
+    } else {
+      WdfRequestComplete (Request, STATUS_BUFFER_TOO_SMALL);
+    }
+    return;
+  }
+  if (Ctx->KeyCount < KEY_RING) {
+    Ctx->KeyRing[(Ctx->KeyHead + Ctx->KeyCount) % KEY_RING] = Report;
+    Ctx->KeyCount++;
+  }
+  WdfSpinLockRelease (Ctx->KeyLock);
+}
+
+/**
+  A key chord: press (modifiers + key) and release.
+**/
+static VOID
+SendChord (PDEVICE_CONTEXT Ctx, UCHAR Modifiers, UCHAR Key, PCSTR Name)
+{
+  OsLog ("mxt1664s: touch key -> %s", Name);
+  QueueKeyReport (Ctx, Modifiers, 0);
+  QueueKeyReport (Ctx, Modifiers, Key);
+  QueueKeyReport (Ctx, Modifiers, 0);
+  QueueKeyReport (Ctx, 0, 0);
+}
+
+/**
+  T15 key bits (mxts.c mxt_treat_T15_object): each key sends its short
+  chord on release, its long chord from a timer while still held.  Runs
+  under the interrupt lock (ISR, or a key timer holding it).
+**/
+static VOID
+MxtHandleKeys (PDEVICE_CONTEXT Ctx, UCHAR Keys)
+{
+  UCHAR  Changed = (UCHAR)(Keys ^ Ctx->KeyState);
+
+  Ctx->KeyState = Keys;
+  if ((Keys & (KEY_MENU | KEY_BACK)) != 0) {
+    KeyLedActivity (Ctx, TRUE);         // only real keys light the keys
+  }
+
+  if ((Changed & KEY_MENU) != 0) {
+    if ((Keys & KEY_MENU) != 0) {
+      if (!Ctx->IgnoreMenu) {
+        Ctx->MenuHeld = TRUE;
+        WdfTimerStart (Ctx->MenuTimer, WDF_REL_TIMEOUT_IN_MS (LONG_PRESS_MS));
+      }
+    } else if (Ctx->MenuHeld) {
+      Ctx->MenuHeld = FALSE;
+      WdfTimerStop (Ctx->MenuTimer, FALSE);
+      SendChord (Ctx, MOD_LCTRL | MOD_LGUI, USAGE_TAB, "Ctrl+Win+Tab");
+    }
+  }
+  if ((Changed & KEY_BACK) != 0) {
+    if ((Keys & KEY_BACK) != 0) {
+      if (Ctx->IgnoreBack) {
+        OsLog ("mxt1664s: back ignored (dummy key)");
+      } else {
+        Ctx->BackHeld = TRUE;
+        WdfTimerStart (Ctx->BackTimer, WDF_REL_TIMEOUT_IN_MS (LONG_PRESS_MS));
+      }
+    } else if (Ctx->BackHeld) {
+      Ctx->BackHeld = FALSE;
+      WdfTimerStop (Ctx->BackTimer, FALSE);
+      SendChord (Ctx, MOD_LGUI, USAGE_D, "Win+D");
+    }
+  }
+  // Dummy nodes touched without their key: suppress it until released.
+  if ((Changed & KEY_D_MENU) != 0) {
+    Ctx->IgnoreMenu = ((Keys & KEY_D_MENU) != 0) && ((Keys & KEY_MENU) == 0);
+  }
+  if ((Changed & KEY_D_BACK) != 0) {
+    Ctx->IgnoreBack = ((Keys & KEY_D_BACK) != 0) && ((Keys & KEY_BACK) == 0);
+  }
+}
+
+VOID
+EvtMenuTimer (WDFTIMER Timer)
+{
+  PDEVICE_CONTEXT  Ctx = GetDeviceContext (WdfTimerGetParentObject (Timer));
+
+  WdfInterruptAcquireLock (Ctx->Interrupt);
+  if (Ctx->MenuHeld) {
+    Ctx->MenuHeld = FALSE;
+    SendChord (Ctx, MOD_LGUI, USAGE_C, "Win+C (menu held)");
+  }
+  WdfInterruptReleaseLock (Ctx->Interrupt);
+}
+
+VOID
+EvtBackTimer (WDFTIMER Timer)
+{
+  PDEVICE_CONTEXT  Ctx = GetDeviceContext (WdfTimerGetParentObject (Timer));
+
+  WdfInterruptAcquireLock (Ctx->Interrupt);
+  if (Ctx->BackHeld) {
+    Ctx->BackHeld = FALSE;
+    SendChord (Ctx, MOD_LGUI, USAGE_TAB, "Win+Tab (back held)");
+  }
+  WdfInterruptReleaseLock (Ctx->Interrupt);
+}
+
+VOID
+EvtLedTimer (WDFTIMER Timer)
+{
+  PDEVICE_CONTEXT  Ctx = GetDeviceContext (WdfTimerGetParentObject (Timer));
+
+  WdfInterruptAcquireLock (Ctx->Interrupt);
+  if ((Ctx->KeyState & (KEY_MENU | KEY_BACK)) == 0) {
+    KeyLedActivity (Ctx, FALSE);
+  } else {
+    WdfTimerStart (Ctx->LedTimer, WDF_REL_TIMEOUT_IN_MS (KEY_LED_TIMEOUT_MS));   // still held
+  }
+  WdfInterruptReleaseLock (Ctx->Interrupt);
+}
+
 static VOID
 MxtHandleMessage (PDEVICE_CONTEXT Ctx, PUCHAR Msg)
 {
   ULONG          Id;
   FINGER_STATE  *Finger;
 
+  if ((Ctx->KeyReports != 0) && (Msg[0] >= Ctx->KeyFirstReport) && (Msg[0] < Ctx->KeyFirstReport + Ctx->KeyReports)) {
+    MxtHandleKeys (Ctx, ((Msg[1] & MXT_T15_DETECT) != 0) ? Msg[2] : 0);
+    return;
+  }
   if ((Msg[0] < Ctx->TouchFirstReport) || (Msg[0] >= Ctx->TouchFirstReport + Ctx->TouchReports)) {
     return;
   }
@@ -409,6 +682,7 @@ SendReport (PDEVICE_CONTEXT Ctx)
   WDFMEMORY         Memory;
   ULONG             Index;
   UCHAR             Count;
+  NTSTATUS          Status;
 
   RtlZeroMemory (&Report, sizeof (Report));
   Report.ReportId = REPORTID_TOUCH;
@@ -432,7 +706,10 @@ SendReport (PDEVICE_CONTEXT Ctx)
   Report.ContactCount = Count;
 
   // No reader waiting: the frame is dropped, the next one has the state.
-  if (!NT_SUCCESS (WdfIoQueueRetrieveNextRequest (Ctx->ReportQueue, &Request))) {
+  WdfSpinLockAcquire (Ctx->KeyLock);
+  Status = WdfIoQueueRetrieveNextRequest (Ctx->ReportQueue, &Request);
+  WdfSpinLockRelease (Ctx->KeyLock);
+  if (!NT_SUCCESS (Status)) {
     if ((Ctx->Dropped++ % 100) == 0) {
       OsLog ("mxt1664s: no HID read pending, %lu reports dropped", Ctx->Dropped);
     }
@@ -581,7 +858,18 @@ EvtInternalDeviceControl (WDFQUEUE Queue, WDFREQUEST Request, size_t OutputBuffe
       break;
 
     case IOCTL_HID_READ_REPORT:
+      WdfSpinLockAcquire (Ctx->KeyLock);
+      if (Ctx->KeyCount != 0) {
+        HID_KEYBOARD_REPORT  Key = Ctx->KeyRing[Ctx->KeyHead];
+
+        Ctx->KeyHead = (Ctx->KeyHead + 1) % KEY_RING;
+        Ctx->KeyCount--;
+        WdfSpinLockRelease (Ctx->KeyLock);
+        Status = CopyToOutput (Request, &Key, sizeof (Key));
+        break;
+      }
       Status = WdfRequestForwardToIoQueue (Request, Ctx->ReportQueue);
+      WdfSpinLockRelease (Ctx->KeyLock);
       if (NT_SUCCESS (Status)) {
         return;
       }
@@ -622,6 +910,7 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, WDFCMRESLIST Re
   Ctx   = GetDeviceContext (Device);
   Gsi   = 0;
   Found = FALSE;
+  Ctx->PmicConnection.QuadPart = 0;
   Count = WdfCmResourceListGetCount (ResourcesTranslated);
   for (Index = 0; Index < Count; Index++) {
     Desc = WdfCmResourceListGetDescriptor (ResourcesTranslated, Index);
@@ -631,6 +920,12 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, WDFCMRESLIST Re
       Ctx->Connection.LowPart  = Desc->u.Connection.IdLowPart;
       Ctx->Connection.HighPart = Desc->u.Connection.IdHighPart;
       Found = TRUE;
+    } else if ((Desc->Type == CmResourceTypeConnection) &&
+               (Desc->u.Connection.Class == CM_RESOURCE_CONNECTION_CLASS_SERIAL) &&
+               (Desc->u.Connection.Type == CM_RESOURCE_CONNECTION_TYPE_SERIAL_I2C)) {
+      // second I2cSerialBus: the PMIC (key backlight)
+      Ctx->PmicConnection.LowPart  = Desc->u.Connection.IdLowPart;
+      Ctx->PmicConnection.HighPart = Desc->u.Connection.IdHighPart;
     } else if (Desc->Type == CmResourceTypeInterrupt) {
       Gsi = WdfCmResourceListGetDescriptor (ResourcesRaw, Index)->u.Interrupt.Vector;
     }
@@ -669,6 +964,33 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, WDFCMRESLIST Re
     return Status;
   }
   FixupReportDescriptor (Ctx);
+
+  //
+  // Key backlight through the PMIC (optional: without the resource the
+  // keys work, unlit).
+  //
+  if ((Ctx->PmicConnection.QuadPart != 0) && (Ctx->Pmic == NULL)) {
+    DECLARE_UNICODE_STRING_SIZE (PmicPath, RESOURCE_HUB_PATH_SIZE);
+
+    Status = RESOURCE_HUB_CREATE_PATH_FROM_ID (&PmicPath, Ctx->PmicConnection.LowPart, Ctx->PmicConnection.HighPart);
+    if (NT_SUCCESS (Status)) {
+      Status = WdfIoTargetCreate (Device, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->Pmic);
+    }
+    if (NT_SUCCESS (Status)) {
+      WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME (&Open, &PmicPath, GENERIC_READ | GENERIC_WRITE);
+      Status = WdfIoTargetOpen (Ctx->Pmic, &Open);
+      if (!NT_SUCCESS (Status)) {
+        WdfObjectDelete (Ctx->Pmic);
+        Ctx->Pmic = NULL;
+      }
+    }
+    OsLog ("mxt1664s: PMIC (key backlight) open 0x%08lx", Status);
+    Ctx->KeyLed = TRUE;                  // force the first write
+    KeyLedActivity (Ctx, FALSE);
+    KeyLedActivity (Ctx, TRUE);          // lit at start, off after the timeout
+  } else if (Ctx->PmicConnection.QuadPart == 0) {
+    OsLog ("mxt1664s: no PMIC resource, key backlight not controlled");
+  }
   OsLog ("mxt1664s: range %ux%u, ready", Ctx->XRange + 1, Ctx->YRange + 1);
   return STATUS_SUCCESS;
 }
@@ -716,6 +1038,36 @@ EvtDeviceAdd (WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     return Status;
   }
 
+  Status = WdfSpinLockCreate (WDF_NO_OBJECT_ATTRIBUTES, &Ctx->KeyLock);
+  if (!NT_SUCCESS (Status)) {
+    return Status;
+  }
+  {
+    WDF_TIMER_CONFIG  TimerConfig;
+
+    WDF_TIMER_CONFIG_INIT (&TimerConfig, EvtMenuTimer);
+    TimerConfig.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT (&Attributes);
+    Attributes.ParentObject   = Device;
+    Attributes.ExecutionLevel = WdfExecutionLevelPassive;
+    Status = WdfTimerCreate (&TimerConfig, &Attributes, &Ctx->MenuTimer);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+    WDF_TIMER_CONFIG_INIT (&TimerConfig, EvtBackTimer);
+    TimerConfig.AutomaticSerialization = FALSE;
+    Status = WdfTimerCreate (&TimerConfig, &Attributes, &Ctx->BackTimer);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+    WDF_TIMER_CONFIG_INIT (&TimerConfig, EvtLedTimer);
+    TimerConfig.AutomaticSerialization = FALSE;
+    Status = WdfTimerCreate (&TimerConfig, &Attributes, &Ctx->LedTimer);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+  }
+
   //
   // CHG (GpioInt): passive-level handling so the ISR can do I2C.
   //
@@ -734,7 +1086,7 @@ DriverEntry (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
   WDF_DRIVER_CONFIG  Config;
 
   OsLogInit ();
-  OsLog ("mxt1664s: DriverEntry");
+  OsLog ("mxt1664s: DriverEntry (built " __DATE__ " " __TIME__ ")");
   WDF_DRIVER_CONFIG_INIT (&Config, EvtDeviceAdd);
   return WdfDriverCreate (DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
