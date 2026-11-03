@@ -1,0 +1,61 @@
+; Exynos5420 Bluetooth (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5012 serial HCI bus driver for the Broadcom BCM4350-family controller
+; on UART0 (exynosuart).  It enumerates MS_BTHX_BTHMINI, which the inbox
+; bth.inf installs the Windows Bluetooth stack (BthMini) on.
+;
+; The patch files come from the stock Android image (/vendor/firmware) and
+; are not part of the source tree: put bcm4350_V0301.0591.hcd and
+; bcm4335_V0105.0541.hcd next to this INF before adding the driver.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/03/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosbt.sys           = 1
+bcm4350_V0301.0591.hcd = 1
+bcm4335_V0105.0541.hcd = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5012
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosbt.sys
+bcm4350_V0301.0591.hcd
+bcm4335_V0105.0541.hcd
+
+[Install.NT.Services]
+AddService = exynosbt, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosbt.sys
+
+[Install.NT.Wdf]
+KmdfService = exynosbt, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 Bluetooth (Broadcom, UART)"

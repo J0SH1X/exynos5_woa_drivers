@@ -1,0 +1,61 @@
+; v1awifi display + Mali-T628 as one full WDDM 1.2 adapter, Windows RT 8.1
+; (exynoswddm, milestone 1: memory segment, allocations, paging, presents,
+; CPU-executed DMA buffers; user-mode driver exynosumd.dll is a stub that
+; logs which runtime opens it).  exynosdisp2 stays the working fallback for
+; the same device.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/03/2026,1.0.0.0
+
+[DestinationDirs]
+Files.Kmd = 12
+Files.Umd = 11
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynoswddm.sys = 1
+exynosumd.dll  = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5010
+
+[Install.NT]
+CopyFiles   = Files.Kmd, Files.Umd
+AddReg      = Umd.AddReg
+FeatureScore = F9
+
+[Files.Kmd]
+exynoswddm.sys
+
+[Files.Umd]
+exynosumd.dll
+
+[Umd.AddReg]
+HKR,, UserModeDriverName, %REG_MULTI_SZ%, exynosumd.dll, exynosumd.dll, exynosumd.dll, exynosumd.dll
+
+[Install.NT.Services]
+AddService = exynoswddm, 0x00000002, Service
+
+[Service]
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 0
+ServiceBinary  = %12%\exynoswddm.sys
+LoadOrderGroup = Video
+
+[Strings]
+Provider     = "Exynos5420"
+Mfg          = "Samsung"
+Disk         = "Exynos5420 drivers"
+DeviceDesc   = "Exynos5420 display + Mali-T628 (full WDDM, test)"
+REG_MULTI_SZ = 0x00010000
+REG_SZ       = 0x00000000

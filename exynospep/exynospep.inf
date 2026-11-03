@@ -1,0 +1,50 @@
+; Exynos5420 Power Engine Plugin (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5014 PoFx plugin: processor idle (WFI) now, CPU performance states
+; next.  Boot start: it has to register before the processor driver
+; (fxppm) brings the processors under the power framework.
+;
+;   pnputil -a exynospep.inf   (then reboot)
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/03/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynospep.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5014
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynospep.sys
+
+[Install.NT.Services]
+AddService = exynospep, 0x00000002, Service
+
+[Service]
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 0               ; SERVICE_BOOT_START
+ErrorControl   = 1
+ServiceBinary  = %12%\exynospep.sys
+LoadOrderGroup = Boot Bus Extender
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5420 power engine plugin"

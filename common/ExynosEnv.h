@@ -48,6 +48,10 @@ static __inline VOID   MmioAnd32 (UINTN A, UINT32 V)    { MmioWrite32 (A, MmioRe
 static __inline VOID   MmioAndThenOr32 (UINTN A, UINT32 And, UINT32 Or) { MmioWrite32 (A, (MmioRead32 (A) & And) | Or); }
 
 #define MicroSecondDelay(Us)  KeStallExecutionProcessor ((ULONG)(Us))
+#ifndef ZeroMem
+#define ZeroMem(p, n)  RtlZeroMemory ((p), (n))
+#define CopyMem(d, s, n)  RtlCopyMemory ((d), (s), (n))
+#endif
 
 static __inline VOID
 EnvSleepMs (UINTN Ms)

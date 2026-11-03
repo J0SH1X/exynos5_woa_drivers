@@ -1,0 +1,53 @@
+; Exynos5420 GPU (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5013 Mali-T628 MP6 (Midgard): power, interrupts, self-test (hardware base of the GPU driver).
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynosgpu.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 10/31/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynosgpu.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5013
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynosgpu.sys
+
+[Install.NT.Services]
+AddService = exynosgpu, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynosgpu.sys
+
+[Install.NT.Wdf]
+KmdfService = exynosgpu, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 Mali-T628 GPU"
