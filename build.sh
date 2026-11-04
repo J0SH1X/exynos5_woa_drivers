@@ -15,7 +15,7 @@ set -e
 cd "$(dirname "$0")"
 
 LIB=${WDK:-$HOME/s2/winsdk/wdk10}/Lib/10.0.19041.0/km/arm
-FIRMWARE=${FIRMWARE:-$HOME/Downloads/mount/vendor/firmware}
+FIRMWARE=${FIRMWARE:-$PWD/firmware}                 # stock blobs, see firmware/README.md
 if [ -n "$LOAD_TEST" ]; then
   export EXTRA_CFLAGS="$EXTRA_CFLAGS -DLOAD_TEST=$LOAD_TEST"
 fi
@@ -110,7 +110,7 @@ for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 
   fi
   # FIMC-IS A5 firmware from the stock image (not in the tree).
   if [ "$d" = exynoscam ]; then
-    cp "${CAM_FIRMWARE:-$HOME/exynos5/camera-test}"/fimc_is_fw2_IMX134.bin "${CAM_FIRMWARE:-$HOME/exynos5/camera-test}"/setfile_imx134.bin "Artifacts/$d/" ||
+    cp "${CAM_FIRMWARE:-$FIRMWARE}"/fimc_is_fw2_IMX134.bin "${CAM_FIRMWARE:-$FIRMWARE}"/setfile_imx134.bin "${CAM_FIRMWARE:-$FIRMWARE}"/setfile_6b2.bin "Artifacts/$d/" ||
       echo "exynoscam: firmware / setfile missing"
   fi
   # exynoswddm's user-mode driver: Mesa d3d10umd + softpipe / panfrost (ARM32 mingw build, see the
