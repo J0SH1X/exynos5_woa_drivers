@@ -1,0 +1,72 @@
+; Exynos5420 camera (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5015 FIMC-IS + rear IMX134 as an AVStream capture device (Camera app / Media Foundation),
+; YUY2 640x480 from the raw sensor stream (software debayer, no ISP yet).
+;
+;   pnputil -i -a exynoscam.inf     (needs exynospmic installed too)
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/04/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynoscam.sys = 1
+fimc_is_fw2_IMX134.bin = 1
+setfile_imx134.bin = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5015
+
+[Install.NT]
+Include   = ks.inf, kscaptur.inf
+Needs     = KS.Registration, KSCAPTUR.Registration.NT
+CopyFiles = Files
+
+[Files]
+exynoscam.sys
+fimc_is_fw2_IMX134.bin
+setfile_imx134.bin
+
+[Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_CAPTURE%,      %KSNAME_Filter%, Cam.Interface
+AddInterface = %KSCATEGORY_VIDEO%,        %KSNAME_Filter%, Cam.Interface
+AddInterface = %KSCATEGORY_VIDEO_CAMERA%, %KSNAME_Filter%, Cam.Interface
+
+[Cam.Interface]
+AddReg = Cam.Interface.AddReg
+
+[Cam.Interface.AddReg]
+HKR,,CLSID,,%ProxyVCap.CLSID%
+HKR,,FriendlyName,,%CameraName%
+
+[Install.NT.Services]
+AddService = exynoscam, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynoscam.sys
+
+[Strings]
+Provider    = "Exynos5420"
+Mfg         = "Samsung"
+Disk        = "Exynos5420 drivers"
+DeviceDesc  = "Exynos5 camera (FIMC-IS)"
+CameraName  = "Exynos5 rear camera"
+KSNAME_Filter           = "GLOBAL"
+KSCATEGORY_CAPTURE      = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_VIDEO        = "{6994AD05-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_VIDEO_CAMERA = "{E5323777-F976-4f5b-9B55-B94699C46E44}"
+ProxyVCap.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"

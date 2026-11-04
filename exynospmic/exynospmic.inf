@@ -1,0 +1,53 @@
+; Exynos5420 PMIC (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5016 MAX77802 PMIC: sole owner of the HS-I2C3 0x09 connection, regulator interface for other drivers.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynospmic.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/04/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynospmic.sys = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5016
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynospmic.sys
+
+[Install.NT.Services]
+AddService = exynospmic, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynospmic.sys
+
+[Install.NT.Wdf]
+KmdfService = exynospmic, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "MAX77802 PMIC"

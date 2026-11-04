@@ -43,7 +43,8 @@ EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E" WDM=1 ./build-dr
   exynosdisp2/exynosdisp2.c exynosdisp2/cores.c exynosdisp2/fimdext.c -- "$LIB/displib.lib" "$LIB/ntstrsafe.lib"
 # Full WDDM 1.2 adapter (display from exynosdisp2 + render side), and its
 # user-mode driver (exynosumd.dll, plain DLL, no CRT).
-EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E" WDM=1 ./build-driver.sh exynoswddm \
+# EXW_GPU_MODE=0: present-only (softpipe in the UMD), 1: the T628 renders (panfrost)
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E -DEXW_GPU_MODE=${EXW_GPU_MODE:-1}" WDM=1 ./build-driver.sh exynoswddm \
   exynoswddm/exynoswddm.c exynoswddm/render.c exynoswddm/cores.c exynoswddm/fimdext.c exynoswddm/ddtrace.c exynoswddm/oslogfile.c -- "$LIB/ntstrsafe.lib"
 ./exynosumd/build.sh
 
@@ -52,6 +53,13 @@ EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E" WDM=1 ./build-dr
 for s in bma255 bmg160 ak8963 cm3323; do
   ./build-driver.sh $s $s/$s.c -- "$LIB/ntstrsafe.lib"
 done
+# MAX77802 PMIC: sole owner of its I2C connection, regulator interface
+# (common/ExPmicIf.h) for camera, GPU, key backlight.
+./build-driver.sh exynospmic exynospmic/exynospmic.c -- "$LIB/ntstrsafe.lib"
+# Camera ISP (FIMC-IS): power, A5 firmware, mailbox interrupt; the core comes
+# from the UEFI tree (exynoscam/cores.c).
+# AVStream capture minidriver (WDM entry): ks.lib + ksguid.lib
+EXTRA_CFLAGS="$EXTRA_CFLAGS -DCDECL= -Wno-missing-braces" WDM=1 ./build-driver.sh exynoscam exynoscam/exynoscam.c exynoscam/cores.c -- "$LIB/ks.lib" "$LIB/ksguid.lib" "$LIB/ntstrsafe.lib"
 # Battery class miniport; the gauge / charger code and the bit-banged I2C are
 # built unchanged from the UEFI tree (exynosbatt/ExynosEnv.h).
 ./build-driver.sh exynosbatt exynosbatt/exynosbatt.c exynosbatt/batterycore.c exynosbatt/gpioi2c.c -- \
@@ -92,13 +100,18 @@ BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
 echo "$BUILD" > .buildnum
 DATE=$(date +%m/%d/%Y)
 
-for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynoswifi exynosemmc bma255 bmg160 ak8963 cm3323 exynosdisp2 exynoswddm exynosuart exynosbt exynosgpu; do
+for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynoswifi exynosemmc bma255 bmg160 ak8963 cm3323 exynosdisp2 exynoswddm exynosuart exynosbt exynosgpu exynoscam exynospmic; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "Artifacts/$d/"
   # Bluetooth patch files from the stock image (not in the tree).
   if [ "$d" = exynosbt ]; then
     cp "$FIRMWARE"/bcm4350_V0301.0591.hcd "$FIRMWARE"/bcm4335_V0105.0541.hcd "Artifacts/$d/" 2>/dev/null ||
       echo "exynosbt: patch files missing in $FIRMWARE"
+  fi
+  # FIMC-IS A5 firmware from the stock image (not in the tree).
+  if [ "$d" = exynoscam ]; then
+    cp "${CAM_FIRMWARE:-$HOME/exynos5/camera-test}"/fimc_is_fw2_IMX134.bin "${CAM_FIRMWARE:-$HOME/exynos5/camera-test}"/setfile_imx134.bin "Artifacts/$d/" ||
+      echo "exynoscam: firmware / setfile missing"
   fi
   # exynoswddm's user-mode driver: Mesa d3d10umd + softpipe / panfrost (ARM32 mingw build, see the
   # mesa-rt notes), test-signed; the exynosumd/ stub (probe) is not shipped.

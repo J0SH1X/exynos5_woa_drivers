@@ -41,6 +41,8 @@
 #define RESHUB_USE_HELPER_ROUTINES
 #include <reshub.h>
 #include "oslog.h"
+#include <initguid.h>
+#include "ExPmicIf.h"
 
 #ifndef LOAD_TEST
 #define LOAD_TEST 0
@@ -282,7 +284,10 @@ typedef struct {
   ULONG         KeyHead;
   ULONG         KeyCount;
 
-  WDFIOTARGET   Pmic;              // MAX77802 (optional)
+  WDFIOTARGET   Pmic;              // MAX77802 (optional; old DSDT with the connection here)
+  EX_PMIC_INTERFACE PmicIf;        // exynospmic (DSDT with the PMIC device)
+  BOOLEAN       PmicIfOk;
+  ULONG         PmicTries;
   LARGE_INTEGER PmicConnection;
   BOOLEAN       KeyLed;
   WDFTIMER      LedTimer;          // backlight off after inactivity
@@ -479,8 +484,25 @@ KeyLedActivity (PDEVICE_CONTEXT Ctx, BOOLEAN On)
   ULONG_PTR              Bytes;
   NTSTATUS               Status;
 
-  if (Ctx->Pmic == NULL) {
-    return;
+  if ((Ctx->Pmic == NULL) && !Ctx->PmicIfOk) {
+    //
+    // exynospmic may start after us (it is a separate driver).  Try its
+    // interface on every call, and keep the LED timer running as a retry
+    // clock until it is there (the backlight then lights once, as at start).
+    //
+    Ctx->PmicIfOk = ExPmicConnect (&Ctx->PmicIf);
+    if (!Ctx->PmicIfOk) {
+      if (Ctx->PmicTries++ < 300) {
+        WdfTimerStart (Ctx->LedTimer, WDF_REL_TIMEOUT_IN_MS (2000));
+      }
+      return;
+    }
+    OsLog ("mxt1664s: key backlight through exynospmic (after %lu tries)", Ctx->PmicTries);
+    Ctx->KeyLed = !On;                   // force the write
+    if (!On) {
+      On = TRUE;                         // first connection: lit at start, off after the timeout
+      Ctx->KeyLed = FALSE;
+    }
   }
   if (On) {
     WdfTimerStart (Ctx->LedTimer, WDF_REL_TIMEOUT_IN_MS (KEY_LED_TIMEOUT_MS));
@@ -490,8 +512,12 @@ KeyLedActivity (PDEVICE_CONTEXT Ctx, BOOLEAN On)
   }
   Buf[0] = PMIC_LDO23_CTRL1;
   Buf[1] = On ? KEY_LED_ON : KEY_LED_OFF;
-  WDF_MEMORY_DESCRIPTOR_INIT_BUFFER (&Input, Buf, sizeof (Buf));
-  Status = WdfIoTargetSendWriteSynchronously (Ctx->Pmic, NULL, &Input, NULL, NULL, &Bytes);
+  if (Ctx->Pmic == NULL) {
+    Status = Ctx->PmicIf.Write (Ctx->PmicIf.Header.Context, Buf[0], Buf[1]);
+  } else {
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER (&Input, Buf, sizeof (Buf));
+    Status = WdfIoTargetSendWriteSynchronously (Ctx->Pmic, NULL, &Input, NULL, NULL, &Bytes);
+  }
   if (NT_SUCCESS (Status)) {
     Ctx->KeyLed = On;
   } else {
@@ -989,7 +1015,9 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST ResourcesRaw, WDFCMRESLIST Re
     KeyLedActivity (Ctx, FALSE);
     KeyLedActivity (Ctx, TRUE);          // lit at start, off after the timeout
   } else if (Ctx->PmicConnection.QuadPart == 0) {
-    OsLog ("mxt1664s: no PMIC resource, key backlight not controlled");
+    OsLog ("mxt1664s: no PMIC resource, key backlight through exynospmic");
+    Ctx->KeyLed = TRUE;
+    KeyLedActivity (Ctx, TRUE);          // connects when exynospmic is there
   }
   OsLog ("mxt1664s: range %ux%u, ready", Ctx->XRange + 1, Ctx->YRange + 1);
   return STATUS_SUCCESS;

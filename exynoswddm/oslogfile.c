@@ -34,11 +34,41 @@ OpenLog (VOID)
   return NT_SUCCESS (Status) ? File : NULL;
 }
 
+/**
+  Flush the C: volume (all its cached data and metadata). Without it a
+  forced reset loses the MFT records of files written in this session -
+  the files Mesa and this driver log to then read as damaged from Linux
+  (ntfs-3g does not replay the NTFS journal). Kernel-mode open: no access
+  check.
+**/
+static VOID
+FlushVolume (VOID)
+{
+  UNICODE_STRING     Name;
+  OBJECT_ATTRIBUTES  Oa;
+  IO_STATUS_BLOCK    Io;
+  HANDLE             Volume = NULL;
+  static ULONG       Logs;
+
+  RtlInitUnicodeString (&Name, L"\\??\\C:");
+  InitializeObjectAttributes (&Oa, &Name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+  if (NT_SUCCESS (ZwCreateFile (&Volume, FILE_WRITE_DATA | SYNCHRONIZE, &Oa, &Io, NULL, 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0))) {
+    NTSTATUS  Status = ZwFlushBuffersFile (Volume, &Io);
+
+    if (Logs++ < 2) {
+      OsLog ("exynoswddm: C: volume flush - 0x%08lx", (ULONG)Status);
+    }
+    ZwClose (Volume);
+  }
+}
+
 static VOID
 LogThread (PVOID Context)
 {
   HANDLE           File = NULL;
   ULONG            Done = 0;
+  ULONG            Ticks = 0;
   BOOLEAN          First = TRUE;
   LARGE_INTEGER    Period;
   IO_STATUS_BLOCK  Io;
@@ -81,6 +111,9 @@ LogThread (PVOID Context)
       if (Wrote) {
         ZwFlushBuffersFile (File, &Io);
       }
+    }
+    if ((++Ticks % 5) == 0) {
+      FlushVolume ();
     }
     KeWaitForSingleObject (&mStopEvent, Executive, KernelMode, FALSE, &Period);
   }

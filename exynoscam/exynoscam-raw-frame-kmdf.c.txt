@@ -1,0 +1,632 @@
+/** @file
+  Exynos5420 camera (FIMC-IS + rear IMX134) for Windows RT 8.1 (KMDF 1.13),
+  milestone 2 "one raw frame": at start a worker thread runs the sequence
+  verified in UEFI by CameraTest.efi raw (2026-11-04):
+
+    1. rear module power (shared CamBoard.c): GPIOs, MCLK, LDO24 / LDO18
+       through exynospmic (common/ExPmicIf.h; waits up to 60 s for it),
+    2. ISP domain, clocks, A5 firmware (System32\drivers\fimc_is_fw2_IMX134.bin),
+       secure configuration through the secure monitor, A5 on (FimcIsCore.c),
+    3. first mailbox message, enum, HIC_OPEN_SENSOR, setfile
+       (System32\drivers\setfile_imx134.bin), stream off, process stop
+       (FimcIsHost.c),
+    4. D-PHY 0 + CSIS0 + FIMC-Lite A DMA armed (CamCapture.c),
+       HIC_STREAM_ON, three frames, HIC_STREAM_OFF,
+    5. HIC_POWER_DOWN, everything off; the frame (3280 x 2458, one RAW10
+       pixel per 16-bit word, black ~64) goes to C:\malikm\camera.raw.
+
+  All shared code comes unchanged from the UEFI tree (exynoscam/cores.c).
+  The mailbox replies are polled during the sequence, so the interrupt
+  (combiner group 19 input 1 = GSI 51, DSDT EXYN5015) stays masked at the
+  combiner for now; the ISR only counts, for the next milestone.
+
+  A5 memory: 20 MiB, contiguous, 64 MiB aligned, non-cached; the ISP
+  SysMMUs are in bypass after reset, so the A5 and FIMC-Lite get physical
+  addresses.
+
+  SPDX-License-Identifier: BSD-2-Clause-Patent
+**/
+
+#define OSLOG_GLOBAL
+#include <ExynosEnv.h>
+#include <wdf.h>
+#include <initguid.h>
+#include "../../uefi/Exynos5420Pkg/Drivers/Camera/FimcIsHost.h"
+#include "../../uefi/Exynos5420Pkg/Drivers/Camera/CamBoard.h"
+#include "../../uefi/Exynos5420Pkg/Drivers/Camera/CamCapture.h"
+#include "../common/ExPmicIf.h"
+
+#define CAM_TAG              'mCxE'
+#define FW_PATH              L"\\SystemRoot\\System32\\drivers\\fimc_is_fw2_IMX134.bin"
+#define SETFILE_PATH         L"\\SystemRoot\\System32\\drivers\\setfile_imx134.bin"
+#define FRAME_PATH           L"\\??\\C:\\malikm\\camera.raw"
+#define FILE_MAX             (4 * 1024 * 1024)
+#define ALIVE_TIMEOUT_MS     3000
+#define PMIC_WAIT_S          60
+
+#define RAW_W                3280
+#define RAW_H                2458
+#define RAW_BYTES            (RAW_W * RAW_H * 2)
+
+#define PMU_SIZE             0x5000
+#define CMU_SIZE             0x11000
+#define SYSREG_SIZE          0x1000
+
+#define SMC_CMD_REG          ((ULONG)-101)
+#define SMC_SFR_W(a)         ((1u << 30) | ((a) >> 2))
+#define SMC_SFR_R(a)         ((3u << 30) | ((a) >> 2))
+
+typedef struct {
+  FIMC_IS            Is;
+  CAM_BOARD          Board;
+  CAM_CAPTURE        Cap;
+  EX_PMIC_INTERFACE  Pmic;
+  PUCHAR             Fw;
+  ULONG              FwSize;
+  PUCHAR             Setfile;
+  ULONG              SetfileSize;
+  PUSHORT            Frame;
+  PHYSICAL_ADDRESS   FramePa;
+  WDFINTERRUPT       Interrupt;
+  volatile LONG      Irqs;
+  PKTHREAD           Thread;
+  volatile BOOLEAN   Stop;
+} CAM_CONTEXT, *PCAM_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME (CAM_CONTEXT, GetCam)
+
+DRIVER_INITIALIZE                DriverEntry;
+EVT_WDF_DRIVER_DEVICE_ADD        EvtDeviceAdd;
+EVT_WDF_DEVICE_PREPARE_HARDWARE  EvtPrepareHardware;
+EVT_WDF_DEVICE_RELEASE_HARDWARE  EvtReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY_POST_INTERRUPTS_ENABLED EvtD0EntryPostInterrupts;
+EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED  EvtD0ExitPreInterrupts;
+EVT_WDF_INTERRUPT_ISR            EvtIsr;
+
+//
+// A5 memory and the frame buffer are non-cached.
+//
+VOID
+EnvCacheClean (
+  IN VOID   *Va,
+  IN UINTN  Size
+  )
+{
+  UNREFERENCED_PARAMETER (Va);
+  UNREFERENCED_PARAMETER (Size);
+  __builtin_arm_dsb (15);
+}
+
+VOID
+EnvCacheInvalidate (
+  IN VOID   *Va,
+  IN UINTN  Size
+  )
+{
+  UNREFERENCED_PARAMETER (Va);
+  UNREFERENCED_PARAMETER (Size);
+  __builtin_arm_dsb (15);
+}
+
+//
+// ---------------------------------------------------------------------------
+// Secure monitor (exynos_smc / exynos_smc_readsfr): r0 = SMC_CMD_REG,
+// r1 = class | address >> 2, r2 = value.  The monitor leaves r0 =
+// SMC_CMD_REG and returns the status in r1 (0 = done), a read value in r2.
+// ---------------------------------------------------------------------------
+//
+static ULONG
+Smc (ULONG A0, ULONG *A1, ULONG *A2)
+{
+  register ULONG  R0 __asm__ ("r0") = A0;
+  register ULONG  R1 __asm__ ("r1") = *A1;
+  register ULONG  R2 __asm__ ("r2") = *A2;
+  register ULONG  R3 __asm__ ("r3") = 0;
+
+  __asm__ volatile (
+    ".arch_extension sec\n\t"
+    "dsb\n\t"
+    "smc #0\n\t"
+    "dsb\n\t"
+    : "+r" (R0), "+r" (R1), "+r" (R2), "+r" (R3)
+    :
+    : "memory", "r12", "lr"
+    );
+  *A1 = R1;
+  *A2 = R2;
+  return (R0 == SMC_CMD_REG) ? R1 : R0;
+}
+
+static INTN
+SecureWrite (UINT32 PhysAddr, UINT32 Value)
+{
+  ULONG  R1 = SMC_SFR_W (PhysAddr);
+  ULONG  R2 = Value;
+
+  return (Smc (SMC_CMD_REG, &R1, &R2) == 0) ? 0 : -1;
+}
+
+static INTN
+SecureRead (UINT32 PhysAddr, UINT32 *Value)
+{
+  ULONG  R1 = SMC_SFR_R (PhysAddr);
+  ULONG  R2 = 0;
+
+  if (Smc (SMC_CMD_REG, &R1, &R2) != 0) {
+    return -1;
+  }
+  *Value = R2;
+  return 0;
+}
+
+//
+// PMIC through exynospmic (CamBoard callbacks).
+//
+static INTN
+PmicRead (VOID *Context, UINT8 Reg, UINT8 *Value)
+{
+  PCAM_CONTEXT  Ctx = (PCAM_CONTEXT)Context;
+
+  return NT_SUCCESS (Ctx->Pmic.Read (Ctx->Pmic.Header.Context, Reg, Value)) ? 0 : -1;
+}
+
+static INTN
+PmicWrite (VOID *Context, UINT8 Reg, UINT8 Value)
+{
+  PCAM_CONTEXT  Ctx = (PCAM_CONTEXT)Context;
+
+  return NT_SUCCESS (Ctx->Pmic.Write (Ctx->Pmic.Header.Context, Reg, Value)) ? 0 : -1;
+}
+
+//
+// The combiner input stays off (replies are polled); count anything that
+// still arrives on the shared line.
+//
+BOOLEAN
+EvtIsr (WDFINTERRUPT Interrupt, ULONG MessageId)
+{
+  PCAM_CONTEXT  Ctx = GetCam (WdfInterruptGetDevice (Interrupt));
+
+  UNREFERENCED_PARAMETER (MessageId);
+  InterlockedIncrement (&Ctx->Irqs);
+  return FALSE;
+}
+
+//
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+//
+
+static NTSTATUS
+LoadFile (PCWSTR Path, PUCHAR *Data, ULONG *Size)
+{
+  UNICODE_STRING             Name;
+  OBJECT_ATTRIBUTES          Attr;
+  IO_STATUS_BLOCK            Io;
+  FILE_STANDARD_INFORMATION  Info;
+  HANDLE                     File;
+  NTSTATUS                   Status;
+
+  *Data = NULL;
+  RtlInitUnicodeString (&Name, Path);
+  InitializeObjectAttributes (&Attr, &Name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+  Status = ZwCreateFile (&File, GENERIC_READ | SYNCHRONIZE, &Attr, &Io, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+                         FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+  if (!NT_SUCCESS (Status)) {
+    return Status;
+  }
+  Status = ZwQueryInformationFile (File, &Io, &Info, sizeof (Info), FileStandardInformation);
+  if (NT_SUCCESS (Status) && ((Info.EndOfFile.HighPart != 0) || (Info.EndOfFile.LowPart > FILE_MAX))) {
+    Status = STATUS_FILE_TOO_LARGE;
+  }
+  if (NT_SUCCESS (Status)) {
+    *Size = Info.EndOfFile.LowPart;
+    *Data = ExAllocatePoolWithTag (NonPagedPool, *Size, CAM_TAG);
+    Status = (*Data != NULL) ? ZwReadFile (File, NULL, NULL, NULL, &Io, *Data, *Size, NULL, NULL)
+                             : STATUS_INSUFFICIENT_RESOURCES;
+  }
+  ZwClose (File);
+  if (!NT_SUCCESS (Status) && (*Data != NULL)) {
+    ExFreePoolWithTag (*Data, CAM_TAG);
+    *Data = NULL;
+  }
+  return Status;
+}
+
+static NTSTATUS
+SaveFile (PCWSTR Path, PVOID Data, ULONG Size)
+{
+  UNICODE_STRING     Name;
+  OBJECT_ATTRIBUTES  Attr;
+  IO_STATUS_BLOCK    Io;
+  HANDLE             File;
+  NTSTATUS           Status;
+
+  RtlInitUnicodeString (&Name, Path);
+  InitializeObjectAttributes (&Attr, &Name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+  Status = ZwCreateFile (&File, GENERIC_WRITE | SYNCHRONIZE, &Attr, &Io, NULL, FILE_ATTRIBUTE_NORMAL, 0,
+                         FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+  if (!NT_SUCCESS (Status)) {
+    return Status;
+  }
+  Status = ZwWriteFile (File, NULL, NULL, NULL, &Io, Data, Size, NULL, NULL);
+  ZwClose (File);
+  return Status;
+}
+
+/**
+  20 MiB at a 64 MiB boundary: ask for exactly the window [k * 64 MiB,
+  k * 64 MiB + 20 MiB) for each k below 4 GiB, highest first.
+**/
+static PVOID
+AllocA5Memory (PHYSICAL_ADDRESS *Pa)
+{
+  PHYSICAL_ADDRESS  Low;
+  PHYSICAL_ADDRESS  High;
+  PHYSICAL_ADDRESS  Boundary;
+  PVOID             Va;
+  LONG              K;
+
+  Boundary.QuadPart = 0;
+  for (K = (LONG)(0x100000000ULL / FIMC_IS_A5_MEM_ALIGN) - 1; K >= 0; K--) {
+    Low.QuadPart  = (LONGLONG)K * FIMC_IS_A5_MEM_ALIGN;
+    High.QuadPart = Low.QuadPart + FIMC_IS_A5_MEM_SIZE - 1;
+    Va = MmAllocateContiguousMemorySpecifyCache (FIMC_IS_A5_MEM_SIZE, Low, High, Boundary, MmNonCached);
+    if (Va != NULL) {
+      *Pa = MmGetPhysicalAddress (Va);
+      if ((Pa->QuadPart & (FIMC_IS_A5_MEM_ALIGN - 1)) == 0) {
+        return Va;
+      }
+      MmFreeContiguousMemorySpecifyCache (Va, FIMC_IS_A5_MEM_SIZE, MmNonCached);
+    }
+  }
+  return NULL;
+}
+
+static VOID
+LogRegs (PCAM_CONTEXT Ctx, PCSTR When)
+{
+  FIMC_IS_REGS  R;
+
+  FimcIsSnapshot (&Ctx->Is, &R);
+  OsLog ("exynoscam: %s: PD 0x%lx/0x%lx A5 cfg 0x%lx st 0x%lx opt 0x%08lx MCUCTLR %08lx ISSR6 %08lx", When,
+         R.PdConfig, R.PdStatus, R.ArmConfig, R.ArmStatus, R.ArmOption, R.Mcuctlr, R.Issr6);
+}
+
+//
+// ---------------------------------------------------------------------------
+// The sequence (worker thread, PASSIVE_LEVEL)
+// ---------------------------------------------------------------------------
+//
+
+static VOID
+Capture (PCAM_CONTEXT Ctx)
+{
+  ULONG   Status;
+  ULONG   CsisSrc;
+  ULONG   Seen = 0;
+  ULONG   SeenCsis = 0;
+  ULONG   Ends = 0;
+  ULONG   Loops;
+  ULONG   Index;
+  ULONG   Changed = 0;
+  ULONGLONG Sum = 0;
+
+  RtlFillMemory (Ctx->Frame, RAW_BYTES, 0xA5);
+  Ctx->Cap.Dphy   = 0;
+  Ctx->Cap.Width  = RAW_W;
+  Ctx->Cap.Height = RAW_H;
+  Ctx->Cap.Settle = 15;
+  Ctx->Cap.Lanes  = 4;
+  Ctx->Cap.BufPa  = (UINT32)Ctx->FramePa.QuadPart;
+  CamCaptureStart (&Ctx->Cap);
+
+  if (FimcIsCommand (&Ctx->Is, "stream on", HIC_STREAM_ON, 0, 0, 0, 0, 0, NULL) != 0) {
+    OsLog ("exynoscam: stream on refused");
+  }
+  for (Loops = 0; (Loops < 30000) && (Ends < 3); Loops++) {
+    Status = CamCaptureTakeStatus (&Ctx->Cap, (UINT32 *)&CsisSrc);
+    Seen |= Status;
+    SeenCsis |= CsisSrc;
+    if (Status & (1u << 4)) {
+      Ends++;
+    }
+    KeStallExecutionProcessor (100);
+  }
+  OsLog ("exynoscam: %lu frame ends in %lu ms (FIMC-Lite status seen %08lx, CSIS %08lx)", Ends, Loops / 10, Seen,
+         SeenCsis);
+  FimcIsCommand (&Ctx->Is, "stream off", HIC_STREAM_OFF, 0, 0, 0, 0, 0, NULL);
+  CamCaptureStop (&Ctx->Cap);
+
+  for (Index = 0; Index < RAW_BYTES / 2; Index++) {
+    if (Ctx->Frame[Index] != 0xA5A5) {
+      Changed++;
+      Sum += Ctx->Frame[Index];
+    }
+  }
+  OsLog ("exynoscam: %lu of %lu pixels written, mean %lu", Changed, (ULONG)(RAW_BYTES / 2),
+         Changed ? (ULONG)(Sum / Changed) : 0);
+  if (Changed != 0) {
+    OsLog ("exynoscam: %S - 0x%08lx", FRAME_PATH, SaveFile (FRAME_PATH, Ctx->Frame, RAW_BYTES));
+  }
+}
+
+static VOID
+Sequence (PCAM_CONTEXT Ctx)
+{
+  FIMC_IS_MSG    Msg;
+  ULONG          Second;
+  LARGE_INTEGER  Interval;
+
+  //
+  // exynospmic may start after us.
+  //
+  for (Second = 0; !ExPmicConnect (&Ctx->Pmic); Second++) {
+    if (Ctx->Stop || (Second >= PMIC_WAIT_S)) {
+      OsLog ("exynoscam: exynospmic not there after %lu s, no sensor power", Second);
+      return;
+    }
+    Interval.QuadPart = -10000000LL;
+    KeDelayExecutionThread (KernelMode, FALSE, &Interval);
+  }
+  OsLog ("exynoscam: exynospmic connected after %lu s", Second);
+
+  Ctx->Board.PmicRead    = PmicRead;
+  Ctx->Board.PmicWrite   = PmicWrite;
+  Ctx->Board.PmicContext = Ctx;
+  if (CamRearPowerOn (&Ctx->Board) != 0) {
+    OsLog ("exynoscam: module power failed at step %lu", Ctx->Board.Step);
+    goto Off;
+  }
+
+  LogRegs (Ctx, "before");
+  if (FimcIsPowerUp (&Ctx->Is, FALSE) != 0) {
+    OsLog ("exynoscam: ISP power-up failed at step %lu", Ctx->Is.Step);
+    goto Off;
+  }
+  if (FimcIsLoadFirmware (&Ctx->Is, Ctx->Fw, Ctx->FwSize) != 0) {
+    OsLog ("exynoscam: firmware does not fit");
+    goto Off;
+  }
+  Ctx->Is.LogPos = 0;
+  if (FimcIsStartA5 (&Ctx->Is) != 0) {
+    OsLog ("exynoscam: A5 start failed at step %lu", Ctx->Is.Step);
+    goto Off;
+  }
+  OsLog ("exynoscam: secure configuration 0x131E0004 = 0x%08lx (0xFC expected)", Ctx->Is.SecureCheck);
+  if (FimcIsWaitMessage (&Ctx->Is, ALIVE_TIMEOUT_MS, &Msg) != 0) {
+    OsLog ("exynoscam: no message from the A5 in %u ms", ALIVE_TIMEOUT_MS);
+    LogRegs (Ctx, "timeout");
+    goto Off;
+  }
+  OsLog ("exynoscam: A5 says cmd 0x%lx params %08lx%s", Msg.Command, Msg.Param[0],
+         (Msg.Command == IHC_GET_SENSOR_NUMBER) ? " -> ALIVE" : "");
+  if (Msg.Command != IHC_GET_SENSOR_NUMBER) {
+    goto Down;
+  }
+  if ((FimcIsOpenRearSensor (&Ctx->Is, FIMC_IS_GROUP_3A0) != 0) ||
+      (FimcIsLoadSetfile (&Ctx->Is, FIMC_IS_GROUP_3A0, Ctx->Setfile, Ctx->SetfileSize) != 0)) {
+    OsLog ("exynoscam: sensor open failed");
+    goto Down;
+  }
+  Capture (Ctx);
+
+Down:
+  FimcIsCommand (&Ctx->Is, "power down", HIC_POWER_DOWN, 0, 0, 0, 0, 0, NULL);
+Off:
+  FimcIsPowerDown (&Ctx->Is);
+  CamRearPowerOff (&Ctx->Board);
+  LogRegs (Ctx, "off");
+  OsLog ("exynoscam: sequence done (%ld interrupts on the shared line)", Ctx->Irqs);
+}
+
+static VOID
+Worker (PVOID Context)
+{
+  Sequence ((PCAM_CONTEXT)Context);
+  PsTerminateSystemThread (STATUS_SUCCESS);
+}
+
+//
+// ---------------------------------------------------------------------------
+// PnP / power
+// ---------------------------------------------------------------------------
+//
+
+static PVOID
+MapPhys (ULONG Address, SIZE_T Size)
+{
+  PHYSICAL_ADDRESS  Pa;
+
+  Pa.QuadPart = Address;
+  return MmMapIoSpace (Pa, Size, MmNonCached);
+}
+
+NTSTATUS
+EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
+{
+  PCAM_CONTEXT                     Ctx = GetCam (Device);
+  PCM_PARTIAL_RESOURCE_DESCRIPTOR  Desc;
+  PHYSICAL_ADDRESS                 Pa;
+  PHYSICAL_ADDRESS                 Low;
+  PHYSICAL_ADDRESS                 High;
+  PHYSICAL_ADDRESS                 Boundary;
+  ULONG                            Index;
+  NTSTATUS                         Status;
+
+  UNREFERENCED_PARAMETER (Raw);
+
+  for (Index = 0; Index < WdfCmResourceListGetCount (Translated); Index++) {
+    Desc = WdfCmResourceListGetDescriptor (Translated, Index);
+    if ((Desc->Type == CmResourceTypeMemory) && (Ctx->Is.Is == 0)) {
+      Ctx->Is.Is = (UINTN)MmMapIoSpace (Desc->u.Memory.Start, FIMC_IS_SIZE, MmNonCached);
+    }
+  }
+  //
+  // Shared windows (PMU, CMU, SYSREG, GPIO, camera interfaces): mapped
+  // here, not claimed in the DSDT.
+  //
+  Ctx->Is.Pmu       = (UINTN)MapPhys (FIMC_IS_PMU_PHYS, PMU_SIZE);
+  Ctx->Is.Cmu       = (UINTN)MapPhys (FIMC_IS_CMU_PHYS, CMU_SIZE);
+  Ctx->Is.Sysreg    = (UINTN)MapPhys (FIMC_IS_SYSREG_PHYS, SYSREG_SIZE);
+  Ctx->Board.GpioLb = (UINTN)MapPhys (CAM_GPIO_LB_PHYS, 0x1000);
+  Ctx->Board.GpioB  = (UINTN)MapPhys (CAM_GPIO_B_PHYS, 0x1000);
+  Ctx->Board.CmuTop = (UINTN)MapPhys (CAM_CMU_TOP_PHYS, 0x1000);
+  Ctx->Cap.Csis     = (UINTN)MapPhys (CAM_CSIS0_PHYS, 0x1000);
+  Ctx->Cap.Flite    = (UINTN)MapPhys (CAM_FLITE_A_PHYS, 0x1000);
+  Ctx->Cap.Pmu      = Ctx->Is.Pmu;
+  if ((Ctx->Is.Is == 0) || (Ctx->Is.Pmu == 0) || (Ctx->Is.Cmu == 0) || (Ctx->Is.Sysreg == 0) ||
+      (Ctx->Board.GpioLb == 0) || (Ctx->Board.GpioB == 0) || (Ctx->Board.CmuTop == 0) || (Ctx->Cap.Csis == 0) ||
+      (Ctx->Cap.Flite == 0)) {
+    OsLog ("exynoscam: register windows missing (IS %p)", (PVOID)Ctx->Is.Is);
+    return STATUS_DEVICE_CONFIGURATION_ERROR;
+  }
+  Ctx->Is.SecureWrite = SecureWrite;
+  Ctx->Is.SecureRead  = SecureRead;
+
+  if (Ctx->Fw == NULL) {
+    Status = LoadFile (FW_PATH, &Ctx->Fw, &Ctx->FwSize);
+    OsLog ("exynoscam: firmware %lu bytes - 0x%08lx", Ctx->FwSize, Status);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+  }
+  if (Ctx->Setfile == NULL) {
+    Status = LoadFile (SETFILE_PATH, &Ctx->Setfile, &Ctx->SetfileSize);
+    OsLog ("exynoscam: setfile %lu bytes - 0x%08lx", Ctx->SetfileSize, Status);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+  }
+  if (Ctx->Is.MemVa == NULL) {
+    Ctx->Is.MemVa = AllocA5Memory (&Pa);
+    if (Ctx->Is.MemVa == NULL) {
+      OsLog ("exynoscam: no 20 MiB / 64 MiB-aligned memory");
+      return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Ctx->Is.MemPa = (UINT32)Pa.QuadPart;
+    OsLog ("exynoscam: A5 memory at 0x%08lx", Ctx->Is.MemPa);
+  }
+  if (Ctx->Frame == NULL) {
+    Low.QuadPart      = 0;
+    High.QuadPart     = 0xFFFFFFFF;
+    Boundary.QuadPart = 0;
+    Ctx->Frame = MmAllocateContiguousMemorySpecifyCache (RAW_BYTES, Low, High, Boundary, MmNonCached);
+    if (Ctx->Frame == NULL) {
+      OsLog ("exynoscam: no %lu-byte frame buffer", (ULONG)RAW_BYTES);
+      return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Ctx->FramePa = MmGetPhysicalAddress (Ctx->Frame);
+  }
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EvtD0EntryPostInterrupts (WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+{
+  PCAM_CONTEXT       Ctx = GetCam (Device);
+  HANDLE             Handle;
+  OBJECT_ATTRIBUTES  Attr;
+  NTSTATUS           Status;
+
+  UNREFERENCED_PARAMETER (PreviousState);
+
+  Ctx->Stop = FALSE;
+  InitializeObjectAttributes (&Attr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+  Status = PsCreateSystemThread (&Handle, THREAD_ALL_ACCESS, &Attr, NULL, NULL, Worker, Ctx);
+  if (NT_SUCCESS (Status)) {
+    ObReferenceObjectByHandle (Handle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)&Ctx->Thread, NULL);
+    ZwClose (Handle);
+  }
+  OsLog ("exynoscam: worker started - 0x%08lx", Status);
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EvtD0ExitPreInterrupts (WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+  PCAM_CONTEXT  Ctx = GetCam (Device);
+
+  UNREFERENCED_PARAMETER (TargetState);
+
+  Ctx->Stop = TRUE;
+  if (Ctx->Thread != NULL) {
+    KeWaitForSingleObject (Ctx->Thread, Executive, KernelMode, FALSE, NULL);
+    ObDereferenceObject (Ctx->Thread);
+    Ctx->Thread = NULL;
+  }
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EvtReleaseHardware (WDFDEVICE Device, WDFCMRESLIST Translated)
+{
+  PCAM_CONTEXT  Ctx = GetCam (Device);
+
+  UNREFERENCED_PARAMETER (Translated);
+
+  if (Ctx->Is.Is != 0) { MmUnmapIoSpace ((PVOID)Ctx->Is.Is, FIMC_IS_SIZE); Ctx->Is.Is = 0; }
+  if (Ctx->Is.Pmu != 0) { MmUnmapIoSpace ((PVOID)Ctx->Is.Pmu, PMU_SIZE); Ctx->Is.Pmu = 0; Ctx->Cap.Pmu = 0; }
+  if (Ctx->Is.Cmu != 0) { MmUnmapIoSpace ((PVOID)Ctx->Is.Cmu, CMU_SIZE); Ctx->Is.Cmu = 0; }
+  if (Ctx->Is.Sysreg != 0) { MmUnmapIoSpace ((PVOID)Ctx->Is.Sysreg, SYSREG_SIZE); Ctx->Is.Sysreg = 0; }
+  if (Ctx->Board.GpioLb != 0) { MmUnmapIoSpace ((PVOID)Ctx->Board.GpioLb, 0x1000); Ctx->Board.GpioLb = 0; }
+  if (Ctx->Board.GpioB != 0) { MmUnmapIoSpace ((PVOID)Ctx->Board.GpioB, 0x1000); Ctx->Board.GpioB = 0; }
+  if (Ctx->Board.CmuTop != 0) { MmUnmapIoSpace ((PVOID)Ctx->Board.CmuTop, 0x1000); Ctx->Board.CmuTop = 0; }
+  if (Ctx->Cap.Csis != 0) { MmUnmapIoSpace ((PVOID)Ctx->Cap.Csis, 0x1000); Ctx->Cap.Csis = 0; }
+  if (Ctx->Cap.Flite != 0) { MmUnmapIoSpace ((PVOID)Ctx->Cap.Flite, 0x1000); Ctx->Cap.Flite = 0; }
+  if (Ctx->Is.MemVa != NULL) {
+    MmFreeContiguousMemorySpecifyCache (Ctx->Is.MemVa, FIMC_IS_A5_MEM_SIZE, MmNonCached);
+    Ctx->Is.MemVa = NULL;
+  }
+  if (Ctx->Frame != NULL) {
+    MmFreeContiguousMemorySpecifyCache (Ctx->Frame, RAW_BYTES, MmNonCached);
+    Ctx->Frame = NULL;
+  }
+  if (Ctx->Fw != NULL) { ExFreePoolWithTag (Ctx->Fw, CAM_TAG); Ctx->Fw = NULL; }
+  if (Ctx->Setfile != NULL) { ExFreePoolWithTag (Ctx->Setfile, CAM_TAG); Ctx->Setfile = NULL; }
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EvtDeviceAdd (WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
+{
+  WDF_PNPPOWER_EVENT_CALLBACKS  PnpPower;
+  WDF_OBJECT_ATTRIBUTES         Attributes;
+  WDF_INTERRUPT_CONFIG          InterruptConfig;
+  WDFDEVICE                     Device;
+  PCAM_CONTEXT                  Ctx;
+  NTSTATUS                      Status;
+
+  UNREFERENCED_PARAMETER (Driver);
+
+  WDF_PNPPOWER_EVENT_CALLBACKS_INIT (&PnpPower);
+  PnpPower.EvtDevicePrepareHardware              = EvtPrepareHardware;
+  PnpPower.EvtDeviceReleaseHardware              = EvtReleaseHardware;
+  PnpPower.EvtDeviceD0EntryPostInterruptsEnabled = EvtD0EntryPostInterrupts;
+  PnpPower.EvtDeviceD0ExitPreInterruptsDisabled  = EvtD0ExitPreInterrupts;
+  WdfDeviceInitSetPnpPowerEventCallbacks (DeviceInit, &PnpPower);
+
+  WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE (&Attributes, CAM_CONTEXT);
+  Status = WdfDeviceCreate (&DeviceInit, &Attributes, &Device);
+  if (!NT_SUCCESS (Status)) {
+    return Status;
+  }
+  Ctx = GetCam (Device);
+
+  WDF_INTERRUPT_CONFIG_INIT (&InterruptConfig, EvtIsr, NULL);
+  Status = WdfInterruptCreate (Device, &InterruptConfig, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->Interrupt);
+  OsLog ("exynoscam: device added - 0x%08lx", Status);
+  return Status;
+}
+
+NTSTATUS
+DriverEntry (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+  WDF_DRIVER_CONFIG  Config;
+
+  OsLogInit ();
+  OsLog ("exynoscam: DriverEntry (built " __DATE__ " " __TIME__ ")");
+  WDF_DRIVER_CONFIG_INIT (&Config, EvtDeviceAdd);
+  return WdfDriverCreate (DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
+}

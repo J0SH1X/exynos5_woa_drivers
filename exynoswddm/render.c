@@ -208,6 +208,28 @@ GpuMap (ADAPTER *A, EX_ALLOCATION *X)
   }
 }
 
+/**
+  Allocation pages First .. First + Count - 1 (= MDL pages) at their GPU
+  address.
+**/
+static VOID
+GpuMapRange (ADAPTER *A, EX_ALLOCATION *X, ULONG First, ULONG Count)
+{
+  NTSTATUS  Status;
+
+  if ((X->Mdl == NULL) || (X->GpuVa == 0) || (Count == 0) || !GpuConnect (A)) {
+    return;
+  }
+  Status = A->Gpu.MapPages (A->Gpu.Header.Context, X->GpuVa + (ULONGLONG)First * PAGE_SIZE,
+                            MmGetMdlPfnArray (X->Mdl) + First, Count);
+  A->Maps++;
+  if (NT_SUCCESS (Status)) {
+    X->GpuMapped = TRUE;
+  } else {
+    A->MapFails++;
+  }
+}
+
 static VOID
 GpuUnmap (ADAPTER *A, EX_ALLOCATION *X)
 {
@@ -475,10 +497,143 @@ ExecBlt (ADAPTER *A, CONST EX_CMD_BLT_ARGS *B, BOOLEAN Fill)
                        (SIZE_T)(R.Right - R.Left) * 4);
       }
     }
-    if (DstX == A->ScanAlloc) {
+    if ((DstX == A->ScanAlloc) && !DstX->GpuPresented) {
       BltToFront (A, Dst, B->DstPitch, &R);
     }
   }
+}
+
+/**
+  The CPU view of GPU address Va (allocation mapped, CpuLock held), or NULL.
+**/
+static PUCHAR
+GpuVaToCpu (ADAPTER *A, ULONGLONG Va, ULONG Bytes)
+{
+  KIRQL          Irql;
+  PLIST_ENTRY    E;
+  EX_ALLOCATION  *Found = NULL;
+  PUCHAR         Cpu;
+
+  KeAcquireSpinLock (&A->AllocLock, &Irql);
+  for (E = A->Allocs.Flink; E != &A->Allocs; E = E->Flink) {
+    EX_ALLOCATION  *X = CONTAINING_RECORD (E, EX_ALLOCATION, Link);
+
+    if ((Va >= X->GpuVa) && (Va + Bytes <= X->GpuVa + ((ULONGLONG)X->Pages << PAGE_SHIFT))) {
+      Found = X;
+      break;
+    }
+  }
+  KeReleaseSpinLock (&A->AllocLock, Irql);
+  if ((Found == NULL) || (Found->Mdl == NULL)) {
+    return NULL;
+  }
+  Cpu = CpuVa (Found);
+  return (Cpu != NULL) ? Cpu + (SIZE_T)(Va - Found->GpuVa) : NULL;
+}
+
+/**
+  After a failed chain: each job header as the GPU left it (Midgard job
+  header: exception status, first incomplete task, fault pointer, type,
+  next job), and the 32 bytes the faulting job's fault pointer names.
+**/
+static VOID
+DumpChain (ADAPTER *A, ULONGLONG Chain)
+{
+  ULONGLONG  Va = Chain;
+  ULONG      N;
+
+  ExAcquireFastMutex (&A->CpuLock);
+  for (N = 0; (N < 12) && (Va != 0); N++) {
+    PUCHAR     H = GpuVaToCpu (A, Va, 0x20);
+    ULONG      Exc;
+    ULONGLONG  Fault;
+    ULONGLONG  Next;
+
+    if (H == NULL) {
+      RLOG ("exynoswddm:   job %lu at 0x%08lx: not mapped", N, (ULONG)Va);
+      break;
+    }
+    Exc   = *(volatile ULONG *)H;
+    Fault = *(volatile ULONGLONG *)(H + 8);
+    Next  = *(volatile ULONGLONG *)(H + 0x18);
+    RLOG ("exynoswddm:   job %lu at 0x%08lx: type %lu exception 0x%08lx first task 0x%08lx fault 0x%08lx%08lx next 0x%08lx",
+          N, (ULONG)Va, (ULONG)(H[0x10] >> 1) & 0x7F, Exc, *(volatile ULONG *)(H + 4), (ULONG)(Fault >> 32),
+          (ULONG)Fault, (ULONG)Next);
+    if (((Exc & 0xFF) >= 0x40) && (Fault != 0)) {
+      PUCHAR  F = GpuVaToCpu (A, Fault & ~0xFull, 32);
+
+      {
+        KIRQL        Irql2;
+        PLIST_ENTRY  E2;
+
+        KeAcquireSpinLock (&A->AllocLock, &Irql2);
+        for (E2 = A->Allocs.Flink; E2 != &A->Allocs; E2 = E2->Flink) {
+          EX_ALLOCATION  *Y = CONTAINING_RECORD (E2, EX_ALLOCATION, Link);
+
+          if ((Fault >= Y->GpuVa) && (Fault < Y->GpuVa + ((ULONGLONG)Y->Pages << PAGE_SHIFT))) {
+            RLOG ("exynoswddm:     in allocation %p: GPU 0x%08lx, %lu pages, flags 0x%lx, MDL %p, %s", Y, (ULONG)Y->GpuVa,
+                  Y->Pages, Y->Info.Flags, Y->Mdl, Y->GpuMapped ? "GPU mapped" : "not GPU mapped");
+            break;
+          }
+        }
+        KeReleaseSpinLock (&A->AllocLock, Irql2);
+      }
+      if (F != NULL) {
+        RLOG ("exynoswddm:     at 0x%08lx: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx", (ULONG)(Fault & ~0xFull),
+              ((volatile ULONG *)F)[0], ((volatile ULONG *)F)[1], ((volatile ULONG *)F)[2], ((volatile ULONG *)F)[3],
+              ((volatile ULONG *)F)[4], ((volatile ULONG *)F)[5], ((volatile ULONG *)F)[6], ((volatile ULONG *)F)[7]);
+      } else {
+        RLOG ("exynoswddm:     fault address 0x%08lx is in no mapped allocation", (ULONG)Fault);
+      }
+    }
+    Va = Next;
+  }
+  ExReleaseFastMutex (&A->CpuLock);
+}
+
+/**
+  After a completed chain: for each fragment job (type 9) the single-target
+  framebuffer descriptor (Midgard v4): colour write enable / format word,
+  bounds, colour writeback address + row stride, the allocation that holds
+  it and two pixels the GPU left there.
+**/
+static VOID
+DumpFragments (ADAPTER *A, ULONGLONG Chain)
+{
+  ULONGLONG  Va = Chain;
+  ULONG      N;
+
+  ExAcquireFastMutex (&A->CpuLock);
+  for (N = 0; (N < 12) && (Va != 0); N++) {
+    PUCHAR  H = GpuVaToCpu (A, Va, 0x40);
+
+    if (H == NULL) {
+      break;
+    }
+    if (((H[0x10] >> 1) & 0x7F) == 9) {
+      ULONGLONG  FbVa = *(volatile ULONGLONG *)(H + 0x28) & ~0x3Full;
+      PUCHAR     Fb = GpuVaToCpu (A, FbVa, 0x80 + 16);
+
+      if (Fb == NULL) {
+        RLOG ("exynoswddm:   fragment job at 0x%08lx: framebuffer 0x%08lx not mapped", (ULONG)Va, (ULONG)FbVa);
+      } else {
+        ULONG      P0 = *(volatile ULONG *)(Fb + 32);
+        ULONG      MaxXY = *(volatile ULONG *)(Fb + 44);
+        ULONGLONG  Color = *(volatile ULONGLONG *)(Fb + 80);
+        ULONG      Stride = *(volatile ULONG *)(Fb + 88);
+        ULONG      W = (MaxXY & 0xFFFF) + 1;
+        ULONG      Hh = (MaxXY >> 16) + 1;
+        PUCHAR     C0 = GpuVaToCpu (A, Color, 4);
+        PUCHAR     Cc = GpuVaToCpu (A, Color + (ULONGLONG)(Hh / 2) * Stride + (W / 2) * 4, 4);
+
+        RLOG ("exynoswddm:   fragment job at 0x%08lx: fb 0x%08lx params0 0x%08lx (write %lu) %lux%lu, colour 0x%08lx stride %lu: (0,0) 0x%08lx centre 0x%08lx",
+              (ULONG)Va, (ULONG)FbVa, P0, P0 >> 31, W, Hh, (ULONG)Color, Stride, C0 ? *(volatile ULONG *)C0 : 0xDEADDEAD,
+              Cc ? *(volatile ULONG *)Cc : 0xDEADDEAD);
+      }
+    }
+    Va = *(volatile ULONGLONG *)(H + 0x18);
+  }
+  ExReleaseFastMutex (&A->CpuLock);
 }
 
 static VOID
@@ -494,8 +649,14 @@ ExecJob (ADAPTER *A, CONST EX_CMD_GPU_JOB_ARGS *J)
   A->LastJsStatus = Status;
   if (Status == 1) {
     A->JobsDone++;
+    if ((J->Slot == 0) && (A->FragDumps++ < 16)) {
+      DumpFragments (A, J->Chain);
+    }
   } else {
     A->JobsFailed++;
+    if (A->JobsFailed <= 4) {
+      DumpChain (A, J->Chain);
+    }
   }
 }
 
@@ -518,7 +679,9 @@ Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
       case EX_CMD_BLT:
       case EX_CMD_COLORFILL:
         if (C->Size >= FIELD_OFFSET (EX_CMD_BLT_ARGS, Rects)) {
+          ExAcquireFastMutex (&A->CpuLock);
           ExecBlt (A, (CONST EX_CMD_BLT_ARGS *)C, C->Op == EX_CMD_COLORFILL);
+          ExReleaseFastMutex (&A->CpuLock);
         }
         break;
       case EX_CMD_GPU_JOB:
@@ -538,6 +701,8 @@ Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
   Flip: the primary into the back scan-out buffer, then FIMD1 to it at the
   next vsync, whose interrupt reports the primary as on screen.
 **/
+static NTSTATUS ScanoutMapTo (ADAPTER *A, ULONGLONG Va, ULONG Index);
+
 static VOID
 ExecFlip (ADAPTER *A, EX_ALLOCATION *X, ULONGLONG PrimaryAddress)
 {
@@ -547,12 +712,49 @@ ExecFlip (ADAPTER *A, EX_ALLOCATION *X, ULONGLONG PrimaryAddress)
   ULONG   Y;
   ULONG   Pitch = (X->Info.Pitch != 0) ? X->Info.Pitch : WIDTH * 4;
 
+  if (X->GpuPresented && (A->ScanGpuVa != 0)) {
+    //
+    // The UMD's GPU blit has put the frame into the off-screen scan-out
+    // buffer (and waited for it): show that one, no copy.  Once the vsync
+    // has latched it, the blit target moves to the other buffer - before
+    // the next job, the next blit, runs (this worker runs them in order).
+    //
+    ULONG          Shown = A->ScanGpuBack;
+    ULONG          Waited;
+    LARGE_INTEGER  Ms;
+
+    A->ScanAlloc      = X;
+    A->ScanAllocBuf   = Shown;
+    A->PendingPrimary = PrimaryAddress;
+    A->PendingPa      = A->ScanBuf[Shown].Pa.LowPart;
+    A->Flips++;
+    A->GpuFlips++;
+    ArmVsync (A, A->ScanBuf[Shown].Pa.LowPart);
+    Ms.QuadPart = -10000;                           // 1 ms
+    for (Waited = 0; A->FlipPending && (Waited < 50); Waited++) {
+      KeDelayExecutionThread (KernelMode, FALSE, &Ms);
+    }
+    if (A->FlipPending) {
+      A->FlipWaitTimeouts++;                        // not latched (yet): keep writing the same buffer
+      return;
+    }
+    if (NT_SUCCESS (ScanoutMapTo (A, A->ScanGpuVa, Shown ^ 1))) {
+      A->ScanGpuBack = Shown ^ 1;
+    }
+    return;
+  }
   if ((Src == NULL) || (Dst == NULL)) {
     A->BadCommands++;
     return;
   }
   for (Y = 0; Y < min (X->Info.Height, (ULONG)HEIGHT); Y++) {
     RtlCopyMemory (Dst + (SIZE_T)Y * WIDTH * 4, Src + (SIZE_T)Y * Pitch, (SIZE_T)min (X->Info.Width, (ULONG)WIDTH) * 4);
+  }
+  if (A->Flips < 8) {
+    PUCHAR  C = Src + (SIZE_T)(min (X->Info.Height, (ULONG)HEIGHT) / 2) * Pitch + (SIZE_T)(min (X->Info.Width, (ULONG)WIDTH) / 2) * 4;
+
+    RLOG ("exynoswddm: flip %lu from %p: center 0x%08lx, (0,0) 0x%08lx -> scan-out %lu", A->Flips, X,
+          *(volatile ULONG *)C, *(volatile ULONG *)Src, Back);
   }
   A->ScanAlloc      = X;
   A->ScanAllocBuf   = Back;
@@ -593,6 +795,8 @@ Complete (ADAPTER *A, ULONG FenceId)
   A->Dxgk.DxgkCbQueueDpc (A->Dxgk.DeviceHandle);
 }
 
+static VOID HandlePreempt (ADAPTER *A);
+
 static VOID
 Worker (PVOID Context)
 {
@@ -611,14 +815,17 @@ Worker (PVOID Context)
 
       if (Now != Seen) {
         Seen = Now;
-        OsLog ("exynoswddm: [5 s] presents %lu (blt %lu fill %lu), submissions %lu, renders %lu, flips %lu, allocations %lu, "
+        OsLog ("exynoswddm: [5 s] presents %lu (blt %lu fill %lu), submissions %lu, renders %lu, flips %lu (%lu no-copy, %lu unlatched), allocations %lu, "
                "fence %lu/%lu, jobs %lu (%lu failed), maps %lu (%lu failed), bad %lu", A->Presents, A->PresentBlts,
-               A->PresentFills, A->Submissions, A->Renders, A->Flips, A->AllocCount, A->LastCompleted, A->LastSubmitted,
+               A->PresentFills, A->Submissions, A->Renders, A->Flips, A->GpuFlips, A->FlipWaitTimeouts, A->AllocCount, A->LastCompleted, A->LastSubmitted,
                A->JobsDone, A->JobsFailed, A->Maps, A->MapFails, A->BadCommands);
       }
       continue;
     }
     for (;;) {
+      if (A->PreemptPending) {
+        HandlePreempt (A);
+      }
       KeAcquireSpinLock (&A->QueueLock, &Irql);
       Have = (A->QueueHead != A->QueueTail);
       if (Have) {
@@ -629,8 +836,25 @@ Worker (PVOID Context)
       if (!Have) {
         break;
       }
-      if (S.Kind == SUB_FLIP) {
-        ExecFlip (A, S.Primary, S.PrimaryAddress);
+      if (S.Kind == SUB_DROPPED) {
+        // preempted before it started: the scheduler resubmits it
+      } else if (S.Kind == SUB_FLIP) {
+        //
+        // VidMm may have unmapped (paging thread) or destroyed the primary
+        // since the flip was queued: under CpuLock, take the entry's
+        // primary again (FreeAllocation clears it) and copy only while it
+        // is still mapped.
+        //
+        ExAcquireFastMutex (&A->CpuLock);
+        KeAcquireSpinLock (&A->QueueLock, &Irql);
+        S.Primary = A->Queue[A->QueueHead % SUBMIT_QUEUE].Primary;
+        KeReleaseSpinLock (&A->QueueLock, Irql);
+        if ((S.Primary != NULL) && (S.Primary->Mdl != NULL)) {
+          ExecFlip (A, S.Primary, S.PrimaryAddress);
+        } else if (A->FlipsSkipped++ < 10) {
+          RLOG ("exynoswddm: flip skipped, primary %p gone or not mapped", S.Primary);
+        }
+        ExReleaseFastMutex (&A->CpuLock);
       } else {
         if (S.Dma != NULL) {
           Execute (A, (PUCHAR)S.Dma, S.Bytes);
@@ -714,6 +938,8 @@ RenderStart (ADAPTER *A)
     InitializeListHead (&A->Allocs);
     ExInitializeFastMutex (&A->VaLock);
     ExInitializeFastMutex (&A->ShadowLock);
+    ExInitializeFastMutex (&A->CpuLock);
+    ExInitializeFastMutex (&A->ScanMapLock);
   }
   OsLog ("exynoswddm: aperture segment %lu MiB (nominal 0x%08lx), GPU addresses 0x%08lx..0x%08lx, scan-out buffers "
          "0x%08lx / 0x%08lx, %s", (ULONG)(APERTURE_BYTES >> 20), (ULONG)APERTURE_BASE, (ULONG)EX_GPU_VA_START,
@@ -755,6 +981,14 @@ RenderStop (ADAPTER *A)
 VOID
 RenderRelease (ADAPTER *A)
 {
+  if ((A->ScanGpuVa != 0) && A->GpuOk) {
+    A->Gpu.UnmapPages (A->Gpu.Header.Context, A->ScanGpuVa, (ULONG)(FB_BYTES >> PAGE_SHIFT));
+  }
+  A->ScanGpuVa = 0;
+  if (A->ScanPfn != NULL) {
+    ExFreePoolWithTag (A->ScanPfn, TAG_VA);
+    A->ScanPfn = NULL;
+  }
   if (A->CarveVa != NULL) {
     MmUnmapIoSpace (A->CarveVa, A->CarveBytes);
     A->CarveVa = NULL;
@@ -898,6 +1132,21 @@ static VOID
 FreeAllocation (ADAPTER *A, EX_ALLOCATION *X)
 {
   KIRQL  Irql;
+  ULONG  Q;
+
+  //
+  // Queued flips must not reach a freed allocation (the worker re-reads
+  // the entry under CpuLock).
+  //
+  ExAcquireFastMutex (&A->CpuLock);
+  KeAcquireSpinLock (&A->QueueLock, &Irql);
+  for (Q = A->QueueHead; Q != A->QueueTail; Q++) {
+    if ((A->Queue[Q % SUBMIT_QUEUE].Kind == SUB_FLIP) && (A->Queue[Q % SUBMIT_QUEUE].Primary == X)) {
+      A->Queue[Q % SUBMIT_QUEUE].Primary = NULL;
+    }
+  }
+  KeReleaseSpinLock (&A->QueueLock, Irql);
+  ExReleaseFastMutex (&A->CpuLock);
 
   if (X->Shadow != NULL) {
     ExAcquireFastMutex (&A->ShadowLock);
@@ -959,7 +1208,35 @@ RnCreateAllocation (IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_CREATEALLOCATION pC
     //
     Granules = (ULONG)(((ULONGLONG)X->Pages * PAGE_SIZE + VA_GRANULE - 1) / VA_GRANULE);
     ExAcquireFastMutex (&A->VaLock);
-    First = RtlFindClearBitsAndSet (&A->VaMap, Granules, 0);
+    if ((In->Flags & EXMW_ALLOC_NOEXEC) || (Granules > EXEC_WINDOW_GRANULES)) {
+      First = RtlFindClearBitsAndSet (&A->VaMap, Granules, 0);
+    } else {
+      //
+      // Executable (shader code): inside one 16 MB window - Midgard's
+      // shader program counter is 24 bits, the upper bits come from the
+      // descriptor (Linux panfrost_gem does the same).  First = 0xFFFFFFFF:
+      // no window has room.
+      //
+      ULONG  Hint = 0;
+
+      First = 0xFFFFFFFF;
+      for (;;) {
+        ULONG  Try = RtlFindClearBits (&A->VaMap, Granules, Hint);
+
+        if ((Try == 0xFFFFFFFF) || (Try < Hint)) {
+          break;                                   // none (RtlFindClearBits wraps around)
+        }
+        if ((Try / EXEC_WINDOW_GRANULES) == ((Try + Granules - 1) / EXEC_WINDOW_GRANULES)) {
+          RtlSetBits (&A->VaMap, Try, Granules);
+          First = Try;
+          break;
+        }
+        Hint = (Try / EXEC_WINDOW_GRANULES + 1) * EXEC_WINDOW_GRANULES;
+        if (Hint >= VA_GRANULES) {
+          break;
+        }
+      }
+    }
     ExReleaseFastMutex (&A->VaLock);
     if (First == 0xFFFFFFFF) {
       RLOG ("exynoswddm: GPU address space full (%lu pages)", X->Pages);
@@ -969,6 +1246,10 @@ RnCreateAllocation (IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_CREATEALLOCATION pC
     X->VaFirst = First;
     X->VaCount = Granules;
     X->GpuVa   = EX_GPU_VA_START + (ULONGLONG)First * VA_GRANULE;
+    if (!(In->Flags & EXMW_ALLOC_NOEXEC) && (A->ExecLogs++ < 30)) {
+      RLOG ("exynoswddm: executable allocation %p: %lu pages at GPU 0x%08lx..0x%08lx", X, X->Pages, (ULONG)X->GpuVa,
+            (ULONG)(X->GpuVa + ((ULONGLONG)X->Pages << PAGE_SHIFT) - 1));
+    }
     KeAcquireSpinLock (&A->AllocLock, &Irql);
     InsertTailList (&A->Allocs, &X->Link);
     KeReleaseSpinLock (&A->AllocLock, Irql);
@@ -1080,6 +1361,7 @@ RnBuildPagingBuffer (IN_CONST_HANDLE hAdapter, IN_PDXGKARG_BUILDPAGINGBUFFER pBu
            (pBuildPagingBuffer->Operation == DXGK_OPERATION_TRANSFER) ? pBuildPagingBuffer->Transfer.hAllocation : NULL,
            (pBuildPagingBuffer->Operation == DXGK_OPERATION_TRANSFER) ? " (transfer)" : "");
   }
+  ExAcquireFastMutex (&A->CpuLock);
   switch (pBuildPagingBuffer->Operation) {
     case DXGK_OPERATION_MAP_APERTURE_SEGMENT: {
       EX_ALLOCATION  *X = (EX_ALLOCATION *)pBuildPagingBuffer->MapApertureSegment.hAllocation;
@@ -1087,16 +1369,38 @@ RnBuildPagingBuffer (IN_CONST_HANDLE hAdapter, IN_PDXGKARG_BUILDPAGINGBUFFER pBu
       if (X == NULL) {
         break;
       }
-      GpuUnmap (A, X);
-      CpuUnmap (X);
-      X->Mdl        = pBuildPagingBuffer->MapApertureSegment.pMdl;
-      X->MdlPage    = (ULONG)pBuildPagingBuffer->MapApertureSegment.MdlOffset;
-      X->SegAddress = APERTURE_BASE + (ULONGLONG)pBuildPagingBuffer->MapApertureSegment.OffsetInPages * PAGE_SIZE;
-      GpuMap (A, X);
-      if (A->PagingLogs < 40) {
-        OsLog ("exynoswddm:   map %p: %lu pages at segment 0x%08lx, MDL page %lu of %lu, GPU %s", X,
-               (ULONG)pBuildPagingBuffer->MapApertureSegment.NumberOfPages, (ULONG)X->SegAddress, X->MdlPage,
-               (ULONG)(MmGetMdlByteCount (X->Mdl) >> PAGE_SHIFT), X->GpuMapped ? "mapped" : "not mapped");
+      {
+        //
+        // pMdl describes the whole allocation (MDL page n = allocation page
+        // n); this operation maps NumberOfPages of them from MdlOffset - a
+        // big allocation can come in pieces.  The old code mapped the whole
+        // allocation from MdlOffset to its GPU address 0: shifted pages,
+        // and the GPU executed other memory than the shader (0x51).
+        //
+        PMDL   Mdl   = pBuildPagingBuffer->MapApertureSegment.pMdl;
+        ULONG  First = (ULONG)pBuildPagingBuffer->MapApertureSegment.MdlOffset;
+        ULONG  Count = (ULONG)pBuildPagingBuffer->MapApertureSegment.NumberOfPages;
+        ULONG  MdlPages = (ULONG)(MmGetMdlByteCount (Mdl) >> PAGE_SHIFT);
+
+        if (X->Mdl != Mdl) {
+          GpuUnmap (A, X);                       // new backing pages
+          CpuUnmap (X);
+          X->Mdl = Mdl;
+        }
+        X->MdlPage = 0;
+        if (First == 0) {
+          X->SegAddress = APERTURE_BASE + (ULONGLONG)pBuildPagingBuffer->MapApertureSegment.OffsetInPages * PAGE_SIZE;
+        }
+        if ((First < X->Pages) && (First < MdlPages)) {
+          Count = min (Count, min (X->Pages, MdlPages) - First);
+          GpuMapRange (A, X, First, Count);
+        }
+        if ((A->PagingLogs < 40) || (((First != 0) || (Count != X->Pages)) && (A->PartialMaps++ < 30))) {
+          OsLog ("exynoswddm:   map %p: %lu pages from MDL page %lu (allocation %lu pages, MDL %lu) at segment page %lu, GPU 0x%08lx %s",
+                 X, Count, First, X->Pages, MdlPages,
+                 (ULONG)pBuildPagingBuffer->MapApertureSegment.OffsetInPages, (ULONG)(X->GpuVa + (ULONGLONG)First * PAGE_SIZE),
+                 X->GpuMapped ? "mapped" : "not mapped");
+        }
       }
       break;
     }
@@ -1133,6 +1437,7 @@ RnBuildPagingBuffer (IN_CONST_HANDLE hAdapter, IN_PDXGKARG_BUILDPAGINGBUFFER pBu
       // transfer / discard: aperture allocations live in their system pages
       break;
   }
+  ExReleaseFastMutex (&A->CpuLock);
   return STATUS_SUCCESS;
 }
 
@@ -1173,11 +1478,23 @@ RnRender (IN_CONST_HANDLE hContext, INOUT_PDXGKARG_RENDER pRender)
   pRender->pDmaBuffer = Out;
   //
   // Nothing to patch (fixed GPU addresses), but VidMm only makes resident
-  // (maps) the allocations a patch location names: the UMD's list (one per
-  // buffer) goes through as it is.
+  // (maps into the aperture, hence the Mali MMU) the allocations a patch
+  // location names.  The UMD (malikm) sends none ("the KMD patches every
+  // entry"): one per allocation-list entry, at DMA offset 0.
   //
-  for (N = 0; (N < pRender->PatchLocationListInSize) && (N < pRender->PatchLocationListOutSize); N++) {
-    pRender->pPatchLocationListOut[N] = pRender->pPatchLocationListIn[N];
+  if (pRender->AllocationListSize > pRender->PatchLocationListOutSize) {
+    if (A->PatchShort++ < 5) {
+      RLOG ("exynoswddm: render: %u allocations, room for %u patch locations", pRender->AllocationListSize,
+            pRender->PatchLocationListOutSize);
+    }
+  }
+  for (N = 0; (N < pRender->AllocationListSize) && (N < pRender->PatchLocationListOutSize); N++) {
+    D3DDDI_PATCHLOCATIONLIST  *P = &pRender->pPatchLocationListOut[N];
+
+    RtlZeroMemory (P, sizeof (*P));
+    P->AllocationIndex = N;
+    P->SlotId          = N;
+    P->PatchOffset     = 0;
   }
   pRender->pPatchLocationListOut += N;
   A->Renders++;
@@ -1374,17 +1691,49 @@ PreemptSync (PVOID Context)
   return TRUE;
 }
 
+/**
+  Worker thread, between submissions (DMA-buffer granularity): the
+  submissions not started yet are dropped - the scheduler resubmits them -
+  then the preemption is reported with the fence that really completed
+  last.  Reporting at once while the queue kept running completed fences
+  the scheduler had written off (bugcheck 0x119, 1).
+**/
+static VOID
+HandlePreempt (ADAPTER *A)
+{
+  PREEMPT_SYNC  P;
+  BOOLEAN       Ret;
+  KIRQL         Irql;
+  ULONG         Q;
+  ULONG         Dropped = 0;
+
+  KeAcquireSpinLock (&A->QueueLock, &Irql);
+  for (Q = A->QueueHead; Q != A->QueueTail; Q++) {
+    if (A->Queue[Q % SUBMIT_QUEUE].Kind == SUB_DMA) {
+      A->Queue[Q % SUBMIT_QUEUE].Kind = SUB_DROPPED;
+      Dropped++;
+    }
+  }
+  P.PreemptionFenceId = A->PreemptFence;
+  InterlockedExchange (&A->PreemptPending, 0);
+  KeReleaseSpinLock (&A->QueueLock, Irql);
+  P.A = A;
+  A->Dxgk.DxgkCbSynchronizeExecution (A->Dxgk.DeviceHandle, PreemptSync, &P, 0, &Ret);
+  A->Dxgk.DxgkCbQueueDpc (A->Dxgk.DeviceHandle);
+  if (A->Preemptions++ < 10) {
+    RLOG ("exynoswddm: preempted (fence %lu): %lu queued submissions dropped, last completed %lu", P.PreemptionFenceId,
+          Dropped, A->LastCompleted);
+  }
+}
+
 static NTSTATUS APIENTRY
 RnPreemptCommand (IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PREEMPTCOMMAND pPreemptCommand)
 {
-  ADAPTER       *A = (ADAPTER *)hAdapter;
-  PREEMPT_SYNC  P;
-  BOOLEAN       Ret;
+  ADAPTER  *A = (ADAPTER *)hAdapter;
 
-  P.A                 = A;
-  P.PreemptionFenceId = pPreemptCommand->PreemptionFenceId;
-  A->Dxgk.DxgkCbSynchronizeExecution (A->Dxgk.DeviceHandle, PreemptSync, &P, 0, &Ret);
-  A->Dxgk.DxgkCbQueueDpc (A->Dxgk.DeviceHandle);
+  A->PreemptFence = pPreemptCommand->PreemptionFenceId;
+  InterlockedExchange (&A->PreemptPending, 1);
+  KeSetEvent (&A->QueueEvent, IO_NO_INCREMENT, FALSE);     // the worker reports it at the next boundary
   return STATUS_SUCCESS;
 }
 
@@ -1485,6 +1834,85 @@ AllocFromHandle (ADAPTER *A, UINT32 Handle)
   return (EX_ALLOCATION *)A->Dxgk.DxgkCbGetHandleData (&Get);
 }
 
+/**
+  ScanBuf[0] (physically contiguous, in the firmware carve-out) mapped into
+  the GPU address space once, for the UMD's GPU blit of DWM's frames
+  (exynos-woa H4b); 0 if it cannot be.
+**/
+/**
+  ScanGpuVa onto ScanBuf[Index] (both physically contiguous, in the
+  firmware carve-out).
+**/
+static NTSTATUS
+ScanoutMapTo (ADAPTER *A, ULONGLONG Va, ULONG Index)
+{
+  ULONG  Pages = (ULONG)(FB_BYTES >> PAGE_SHIFT);
+  ULONG  I;
+
+  for (I = 0; I < Pages; I++) {
+    A->ScanPfn[I] = (PFN_NUMBER)((A->ScanBuf[Index].Pa.QuadPart >> PAGE_SHIFT) + I);
+  }
+  return A->Gpu.MapPages (A->Gpu.Header.Context, Va, A->ScanPfn, Pages);
+}
+
+/**
+  The scan-out in the GPU address space, for the UMD's GPU blit of DWM's
+  frames (exynos-woa H4b), mapped once onto the scan-out buffer that is
+  off screen; every no-copy flip shows that buffer and moves the mapping
+  to the other one (ExecFlip), so the blit never writes what the panel
+  reads.  0 if it cannot be mapped.
+**/
+static ULONGLONG
+ScanoutGpuVa (ADAPTER *A)
+{
+  ULONG        Pages = (ULONG)(FB_BYTES >> PAGE_SHIFT);
+  ULONG        Granules = (ULONG)((FB_BYTES + VA_GRANULE - 1) / VA_GRANULE);
+  ULONG        First;
+  ULONG        Back;
+  ULONGLONG    Va;
+  NTSTATUS     Status;
+
+  if ((A->ScanGpuVa != 0) || !EXW_GPU_MODE || (A->CarveVa == NULL) || !GpuConnect (A)) {
+    return A->ScanGpuVa;
+  }
+  ExAcquireFastMutex (&A->ScanMapLock);            // one mapping, whichever process asks first
+  if (A->ScanGpuVa != 0) {
+    ExReleaseFastMutex (&A->ScanMapLock);
+    return A->ScanGpuVa;
+  }
+  if (A->ScanPfn == NULL) {
+    A->ScanPfn = ExAllocatePoolWithTag (NonPagedPool, Pages * sizeof (PFN_NUMBER), TAG_VA);
+  }
+  if (A->ScanPfn == NULL) {
+    ExReleaseFastMutex (&A->ScanMapLock);
+    return 0;
+  }
+  ExAcquireFastMutex (&A->VaLock);
+  First = RtlFindClearBitsAndSet (&A->VaMap, Granules, 0);
+  ExReleaseFastMutex (&A->VaLock);
+  if (First == 0xFFFFFFFF) {
+    ExReleaseFastMutex (&A->ScanMapLock);
+    return 0;
+  }
+  Va     = EX_GPU_VA_START + (ULONGLONG)First * VA_GRANULE;
+  Back   = (A->ScanFront == 0) ? 1 : 0;
+  Status = ScanoutMapTo (A, Va, Back);
+  OsLog ("exynoswddm: scan-out buffer %lu (0x%08lx, %lu pages) at GPU 0x%08lx - 0x%08lx", Back,
+         A->ScanBuf[Back].Pa.LowPart, Pages, (ULONG)Va, Status);
+  if (!NT_SUCCESS (Status)) {
+    ExAcquireFastMutex (&A->VaLock);
+    RtlClearBits (&A->VaMap, First, Granules);
+    ExReleaseFastMutex (&A->VaLock);
+    ExReleaseFastMutex (&A->ScanMapLock);
+    return 0;
+  }
+  A->ScanVaFirst = First;
+  A->ScanGpuBack = Back;
+  A->ScanGpuVa   = Va;
+  ExReleaseFastMutex (&A->ScanMapLock);
+  return Va;
+}
+
 static NTSTATUS APIENTRY
 RnEscape (IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pEscape)
 {
@@ -1560,7 +1988,19 @@ RnEscape (IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pEscape)
       if (Size < sizeof (*S)) {
         return STATUS_BUFFER_TOO_SMALL;
       }
-      S->GpuVa  = 0;                           // not mapped: presents are CPU copies here
+      S->GpuVa  = ScanoutGpuVa (A);            // 0: not mapped, presents stay CPU copies
+      if ((S->GpuVa != 0) && (S->hAllocation != 0)) {
+        EX_ALLOCATION  *X = AllocFromHandle (A, S->hAllocation);
+
+        if (X == NULL) {
+          return STATUS_INVALID_HANDLE;
+        }
+        if (!X->GpuPresented) {
+          X->GpuPresented = TRUE;
+          RLOG ("exynoswddm: primary %p (0x%x) is GPU-presented, scan-out GPU 0x%08lx", X, S->hAllocation,
+                (ULONG)S->GpuVa);
+        }
+      }
       S->Width  = WIDTH;
       S->Height = HEIGHT;
       S->Pitch  = WIDTH * 4;

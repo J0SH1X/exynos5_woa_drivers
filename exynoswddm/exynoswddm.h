@@ -33,8 +33,10 @@
 #define APERTURE_BYTES     (1024ull * 1024 * 1024)
 #define VA_GRANULE         0x10000u                         // GPU address granule (64 KiB)
 #define VA_GRANULES        ((ULONG)((EX_GPU_VA_END - EX_GPU_VA_START) / VA_GRANULE))
+#define EXEC_WINDOW_GRANULES  ((ULONG)((16u << 20) / VA_GRANULE))   // executable allocations stay in one 16 MB window
+                                                                  // (EX_GPU_VA_START is 16 MB aligned)
 #define SUBMIT_QUEUE       256
-#define GPU_JOB_TIMEOUT_MS 2000
+#define GPU_JOB_TIMEOUT_MS 500                   // well under the 2 s TDR: a faulting job fails, no timeout recovery
 
 typedef struct {
   PUCHAR                  Va;
@@ -45,6 +47,7 @@ typedef struct _EX_ALLOCATION  EX_ALLOCATION;
 
 #define SUB_DMA   0                      // a DMA buffer range, then its fence
 #define SUB_FLIP  1                      // copy a primary to the back scan-out buffer, flip
+#define SUB_DROPPED 2                    // a DMA submission dropped by a preemption
 
 typedef struct {
   ULONG                   Kind;
@@ -72,6 +75,7 @@ struct _EX_ALLOCATION {
   ULONGLONG               SegAddress;    // APERTURE_BASE + offset, while mapped
   BOOLEAN                 GpuMapped;
   BOOLEAN                 MapTried;      // GpuConnect's catch-up pass
+  BOOLEAN                 GpuPresented;  // the UMD blits its frames into the scan-out on the GPU (no CPU copy)
   PMDL                    CpuMdl;        // partial MDL for the CPU mapping
   PUCHAR                  CpuVa;         // write-combined, while mapped (lazy)
   PUCHAR                  Shadow;        // present-only: the creator's last published frame (paged pool)
@@ -123,10 +127,19 @@ typedef struct _ADAPTER {
   PUCHAR                  CarveVa;       // firmware carve-out (scan-out buffers)
   PHYSICAL_ADDRESS        CarvePa;
   ULONG                   CarveBytes;
+  ULONGLONG               ScanGpuVa;     // ScanBuf[0] in the GPU address space (0: not mapped yet)
+  ULONG                   ScanVaFirst;   // its VaMap granules
+  ULONG                   ScanGpuBack;   // the ScanBuf ScanGpuVa maps now (the UMD's blit target, off screen)
+  PFN_NUMBER              *ScanPfn;      // FB_BYTES / PAGE_SIZE entries, for remapping ScanGpuVa
+  ULONG                   FlipWaitTimeouts;
+  ULONG                   GpuFlips;      // flips of GPU-presented primaries (no copy)
+  FAST_MUTEX              ScanMapLock;
   KSPIN_LOCK              AllocLock;     // the allocation list
   LIST_ENTRY              Allocs;
   FAST_MUTEX              VaLock;
   FAST_MUTEX              ShadowLock;    // EX_ALLOCATION Shadow*
+  FAST_MUTEX              CpuLock;       // CPU mappings (CpuVa / Mdl) vs. the worker's copies and VidMm's paging
+  ULONG                   FlipsSkipped;
   ULONG                   ShadowPublishes;
   ULONG                   ShadowFetches;
   RTL_BITMAP              VaMap;
@@ -136,6 +149,13 @@ typedef struct _ADAPTER {
   ULONG                   GpuTries;
   volatile LONG           Running;
   ULONG                   Renders;
+  ULONG                   PatchShort;
+  ULONG                   PartialMaps;
+  ULONG                   ExecLogs;
+  ULONG                   FragDumps;
+  volatile LONG           PreemptPending;
+  ULONG                   PreemptFence;
+  ULONG                   Preemptions;
   ULONG                   PresentBlts;
   ULONG                   PresentFills;
   ULONG                   Maps;

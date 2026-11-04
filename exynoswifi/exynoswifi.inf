@@ -1,0 +1,76 @@
+; v1awifi (SM-P900) Wi-Fi: Broadcom BCM4354 (FullMAC) on SDIO, Windows RT 8.1.
+; A Native 802.11 (ExtSTA) NDIS 6.30 miniport: Windows' WLAN service manages
+; it (network list, profiles, WPA2, taskbar).  Same device as exynoswlan
+; (the Ethernet-style driver, which stays the fallback); install one or the
+; other.
+;
+; The firmware files are Broadcom/Samsung blobs (from the stock Android
+; system: /system/etc/wifi/bcmdhd_sta.bin, nvram_net.txt_4354_a1 renamed to
+; nvram_net.txt) and are not part of the source tree: put them next to this
+; INF before adding the driver.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynoswifi.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/02/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynoswifi.sys = 1
+bcmdhd_sta.bin = 1
+nvram_net.txt  = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\VEN_EXYN&DEV_5009
+%DeviceDesc% = Install, ACPI\EXYN5009
+
+[Install.NT]
+Characteristics = 0x84                    ; NCF_PHYSICAL | NCF_HAS_UI
+*IfType         = 71                      ; IF_TYPE_IEEE80211
+*MediaType      = 16                      ; NdisMediumNative802_11
+*PhysicalMediaType = 9                    ; NdisPhysicalMediumNative802_11
+*IfConnectorPresent = 1
+*ConnectionType = 1
+*DirectionType  = 0
+*AccessType     = 2
+*HardwareLoopback = 0
+CopyFiles       = Files
+AddReg          = Ndi_AddReg
+
+[Files]
+exynoswifi.sys
+bcmdhd_sta.bin
+nvram_net.txt
+
+[Ndi_AddReg]
+HKR, Ndi,            Service,    0, "exynoswifi"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "wlan,ethernet"
+
+[Install.NT.Services]
+AddService = exynoswifi, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynoswifi.sys
+LoadOrderGroup = NDIS
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Broadcom"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "BCM4354 Native Wi-Fi (SM-P900)"

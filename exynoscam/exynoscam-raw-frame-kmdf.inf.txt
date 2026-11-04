@@ -1,0 +1,57 @@
+; Exynos5420 camera ISP (v1awifi, SM-P900), Windows RT 8.1:
+; EXYN5015 FIMC-IS: ISP power, Cortex-A5 firmware, mailbox interrupt (milestone "one raw frame" to C:\malikm\camera.raw).
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynoscam.inf /ForceUnsigned
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 11/04/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynoscam.sys = 1
+fimc_is_fw2_IMX134.bin = 1
+setfile_imx134.bin = 1
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5015
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynoscam.sys
+fimc_is_fw2_IMX134.bin
+setfile_imx134.bin
+
+[Install.NT.Services]
+AddService = exynoscam, 0x00000002, Service
+
+[Service]
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\exynoscam.sys
+
+[Install.NT.Wdf]
+KmdfService = exynoscam, Wdf
+
+[Wdf]
+KmdfLibraryVersion = 1.13
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 camera ISP (FIMC-IS)"

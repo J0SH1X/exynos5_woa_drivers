@@ -46,6 +46,14 @@ their public PDBs):
    `Windows\System32\drivers\exynospep.sys`, then read the log ring from
    UEFI (`usbdbg.py oslog`).
 
+## Test results
+exynospep: DriverEntry (built Nov  3 2026 06:14:38)
+exynospep: PoFxRegisterPlugin (PEP v2 12 bytes, kernel v2 44 bytes) - 0x00000000
+exynospep: device added (0 processors registered so far)
+exynospep: device \_SB.PEP0 declined
+exynospep: device \_SB.PEP0 declined
+
+
 ## Next
 
 - **CPU DVFS** (`PPM_QUERY_PERF_CAPABILITIES` / `PERF_SET`, 0x0B / 0x0D):

@@ -26,12 +26,14 @@
 #include <initguid.h>
 #include "../../uefi/Exynos5420Pkg/Drivers/Gpu/MaliCore.h"
 #include "../common/ExGpuIf.h"
+#include "../common/ExPmicIf.h"
 
 #define GPU_TAG          'uGxE'
 #define GPU_MHZ          266
 #define GPU_VDD_UV       (862500 + 25000)          // gpu_exynos5420.c 266 MHz OPP + margin
 #define BUF_BYTES        (64 * 1024)
-#define PT_BYTES         (2 * 1024 * 1024)      // address space 0 tables: ~1 GiB of 4 KiB mappings
+#define PT_BYTES         (8 * 1024 * 1024)      // address space 0 tables: the whole 0x10000000..0xF0000000 range
+                                                // (bump-allocated, never freed: 2 MiB ran out after ~20k chains)
 #define JOB_TIMEOUT_MS   500
 
 //
@@ -52,8 +54,12 @@
 
 typedef struct {
   EXYNOS_MALI      Mali;
-  WDFIOTARGET      Pmic;
+  WDFIOTARGET      Pmic;               // old DSDT: own PMIC connection
   LARGE_INTEGER    PmicId;
+  EX_PMIC_INTERFACE PmicIf;            // new DSDT: through exynospmic
+  BOOLEAN          PmicIfOk;
+  WDFTIMER         PmicTimer;          // retries the exynospmic connection (vdd_g3d)
+  ULONG            PmicTries;
   WDFINTERRUPT     Interrupt[3];       // job, MMU, GPU
   ULONG            InterruptCount;
   volatile LONG    JobDone;            // JOB_INT bits seen
@@ -79,6 +85,7 @@ EVT_WDF_DEVICE_D0_ENTRY_POST_INTERRUPTS_ENABLED EvtD0EntryPostInterrupts;
 EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED  EvtD0ExitPreInterrupts;
 EVT_WDF_INTERRUPT_ISR            EvtIsr;
 EVT_WDF_INTERRUPT_DPC            EvtDpc;
+EVT_WDF_TIMER                    EvtPmicTimer;
 
 //
 // The buffers are non-cached (MmNonCached contiguous memory): nothing to
@@ -112,6 +119,9 @@ PmicWrite (PGPU_CONTEXT Ctx, UCHAR Reg, UCHAR Value)
   UCHAR                  Buf[2] = { Reg, Value };
   WDF_MEMORY_DESCRIPTOR  In;
 
+  if (Ctx->Pmic == NULL) {
+    return Ctx->PmicIf.Write (Ctx->PmicIf.Header.Context, Reg, Value);
+  }
   WDF_MEMORY_DESCRIPTOR_INIT_BUFFER (&In, Buf, sizeof (Buf));
   return WdfIoTargetSendWriteSynchronously (Ctx->Pmic, NULL, &In, NULL, NULL, NULL);
 }
@@ -122,6 +132,9 @@ PmicRead (PGPU_CONTEXT Ctx, UCHAR Reg, PUCHAR Value)
   SPB_TRANSFER_LIST_AND_ENTRIES (2) Seq;
   WDF_MEMORY_DESCRIPTOR          In;
 
+  if (Ctx->Pmic == NULL) {
+    return Ctx->PmicIf.Read (Ctx->PmicIf.Header.Context, Reg, Value);
+  }
   SPB_TRANSFER_LIST_INIT (&Seq.List, 2);
   Seq.List.Transfers[0] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE (SpbTransferDirectionToDevice, 0, &Reg, 1);
   Seq.List.Transfers[1] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE (SpbTransferDirectionFromDevice, 0, Value, 1);
@@ -480,11 +493,15 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
   }
   Ctx->Mali.Cmu = (UINTN)MapPhys (MALI_CMU_TOP_PHYS, 0x1000);
   Ctx->Mali.Pmu = (UINTN)MapPhys (MALI_PMU_G3D_PHYS, 0x1000);
-  if ((Ctx->Mali.Gpu == 0) || (Ctx->Mali.Cmu == 0) || (Ctx->Mali.Pmu == 0) || (Ctx->PmicId.QuadPart == 0)) {
+  if ((Ctx->Mali.Gpu == 0) || (Ctx->Mali.Cmu == 0) || (Ctx->Mali.Pmu == 0)) {
     OsLog ("exynosgpu: resources missing (GPU %p, PMIC 0x%08lx)", (PVOID)Ctx->Mali.Gpu, Ctx->PmicId.LowPart);
     return STATUS_DEVICE_CONFIGURATION_ERROR;
   }
 
+  if (Ctx->PmicId.QuadPart == 0) {
+    OsLog ("exynosgpu: no PMIC connection: vdd_g3d through exynospmic");
+    goto Memory;
+  }
   Status = RESOURCE_HUB_CREATE_PATH_FROM_ID (&Path, Ctx->PmicId.LowPart, Ctx->PmicId.HighPart);
   if (NT_SUCCESS (Status) && (Ctx->Pmic == NULL)) {
     Status = WdfIoTargetCreate (Device, WDF_NO_OBJECT_ATTRIBUTES, &Ctx->Pmic);
@@ -507,6 +524,7 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
     OsLog ("exynosgpu: no PMIC, vdd_g3d left as set by the bootloader");
   }
 
+Memory:
   //
   // GPU memory: non-cached, contiguous, below 4 GiB (1:1 GPU mapping).
   //
@@ -527,6 +545,31 @@ EvtPrepareHardware (WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
   return STATUS_SUCCESS;
 }
 
+/**
+  exynospmic is a separate driver and may start after the GPU: until it is
+  there the GPU runs at the bootloader's vdd_g3d; then the level goes in.
+**/
+VOID
+EvtPmicTimer (WDFTIMER Timer)
+{
+  PGPU_CONTEXT  Ctx = GetGpu (WdfTimerGetParentObject (Timer));
+
+  if (Ctx->PmicIfOk || !Ctx->Up) {
+    return;
+  }
+  Ctx->PmicIfOk = ExPmicConnect (&Ctx->PmicIf);
+  if (!Ctx->PmicIfOk) {
+    if (++Ctx->PmicTries < 60) {
+      WdfTimerStart (Ctx->PmicTimer, WDF_REL_TIMEOUT_IN_MS (2000));
+    }
+    return;
+  }
+  OsLog ("exynosgpu: exynospmic connected after %lu tries", Ctx->PmicTries);
+  ExAcquireFastMutex (&Ctx->Lock);
+  SetVddG3d (Ctx, GPU_VDD_UV);
+  ExReleaseFastMutex (&Ctx->Lock);
+}
+
 NTSTATUS
 EvtD0EntryPostInterrupts (WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
@@ -534,7 +577,15 @@ EvtD0EntryPostInterrupts (WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState
 
   UNREFERENCED_PARAMETER (PreviousState);
 
-  if ((Ctx->Pmic != NULL) && !NT_SUCCESS (SetVddG3d (Ctx, GPU_VDD_UV))) {
+  if ((Ctx->Pmic == NULL) && !Ctx->PmicIfOk && (Ctx->PmicId.QuadPart == 0)) {
+    Ctx->PmicIfOk = ExPmicConnect (&Ctx->PmicIf);
+    OsLog ("exynosgpu: exynospmic %s", Ctx->PmicIfOk ? "connected" : "not there yet: vdd_g3d as set by the bootloader until it is");
+    if (!Ctx->PmicIfOk) {
+      Ctx->PmicTries = 0;
+      WdfTimerStart (Ctx->PmicTimer, WDF_REL_TIMEOUT_IN_MS (2000));
+    }
+  }
+  if (((Ctx->Pmic != NULL) || Ctx->PmicIfOk) && !NT_SUCCESS (SetVddG3d (Ctx, GPU_VDD_UV))) {
     return STATUS_DEVICE_POWER_FAILURE;
   }
   if (MaliPowerUp (&Ctx->Mali, GPU_MHZ) != 0) {
@@ -575,6 +626,7 @@ EvtD0ExitPreInterrupts (WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 
   UNREFERENCED_PARAMETER (TargetState);
 
+  WdfTimerStop (Ctx->PmicTimer, TRUE);
   if (Ctx->Up) {
     Ctx->Up = FALSE;
     MaliAsDisable (&Ctx->Mali, 0);
@@ -627,6 +679,20 @@ EvtDeviceAdd (WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
   Ctx = GetGpu (Device);
   KeInitializeEvent (&Ctx->JobEvent, NotificationEvent, FALSE);
   ExInitializeFastMutex (&Ctx->Lock);
+  {
+    WDF_TIMER_CONFIG       TimerConfig;
+    WDF_OBJECT_ATTRIBUTES  TimerAttributes;
+
+    WDF_TIMER_CONFIG_INIT (&TimerConfig, EvtPmicTimer);
+    TimerConfig.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT (&TimerAttributes);
+    TimerAttributes.ParentObject    = Device;
+    TimerAttributes.ExecutionLevel  = WdfExecutionLevelPassive;
+    Status = WdfTimerCreate (&TimerConfig, &TimerAttributes, &Ctx->PmicTimer);
+    if (!NT_SUCCESS (Status)) {
+      return Status;
+    }
+  }
 
   //
   // The direct-call interface for exynoswddm.

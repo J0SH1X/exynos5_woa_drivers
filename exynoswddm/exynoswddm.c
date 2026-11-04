@@ -1606,6 +1606,7 @@ typedef struct {
 // RtlPcToFileHeader gives (the list head never matches).
 //
 static PLIST_ENTRY  mOwnModule;
+static PVOID        mOwnBase;
 
 NTSYSAPI PVOID NTAPI RtlPcToFileHeader (PVOID PcValue, PVOID *BaseOfImage);
 
@@ -1665,18 +1666,29 @@ BugCheckCallback (PVOID Buffer, ULONG Length)
     HexOut (Line + 31 + N * 10, KiBugCheckData[1 + N]);
   }
   OsLogWrite (Line, sizeof (Line) - 1);
-  {
+  //
+  // The faulting PC: parameter 2 for 0x1E / 0x7E / 0x8E, parameter 3 for
+  // 0x50 / 0xD1 / 0x0A - resolve both, plus our own load address.
+  //
+  for (N = 2; N <= 3; N++) {
     char   Where[48];
-    char   Text[64] = "exynoswddm: BUGCHECK at ";
-    ULONG  L = 24;
-    ULONG  N;
+    char   Text[72] = "exynoswddm: BUGCHECK p? at ";
+    ULONG  L = 27;
+    ULONG  K;
 
-    WhereIs (KiBugCheckData[2], Where);     // 0x1E / 0x7E / 0x8E: the exception address
-    for (N = 0; Where[N] && (L < sizeof (Text) - 2); N++) {
-      Text[L++] = Where[N];
+    Text[22] = (char)('0' + N);
+    WhereIs (KiBugCheckData[N], Where);
+    for (K = 0; Where[K] && (L < sizeof (Text) - 2); K++) {
+      Text[L++] = Where[K];
     }
     Text[L++] = '\n';
     OsLogWrite (Text, L);
+  }
+  {
+    char  Own[] = "exynoswddm: loaded at xxxxxxxx\n";
+
+    HexOut (Own + 22, (ULONG_PTR)mOwnBase);
+    OsLogWrite (Own, sizeof (Own) - 1);
   }
 }
 
@@ -1689,6 +1701,8 @@ DriverEntry (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
   OsLog ("exynoswddm: DriverEntry (built " __DATE__ " " __TIME__ ")");
   KeInitializeCallbackRecord (&mBugCheckRecord);
   mOwnModule = (PLIST_ENTRY)DriverObject->DriverSection;
+  mOwnBase   = DriverObject->DriverStart;
+  OsLog ("exynoswddm: loaded at %p", mOwnBase);
   KeRegisterBugCheckCallback (&mBugCheckRecord, BugCheckCallback, NULL, 0, (PUCHAR)"exynoswddm");
 
   RtlZeroMemory (&Init, sizeof (Init));
