@@ -36,13 +36,16 @@
 #define CAM_TAG              'mCxE'
 #define FW_PATH              L"\\SystemRoot\\System32\\drivers\\fimc_is_fw2_IMX134.bin"
 #define SETFILE_PATH         L"\\SystemRoot\\System32\\drivers\\setfile_imx134.bin"
+#define SETFILE_FRONT_PATH   L"\\SystemRoot\\System32\\drivers\\setfile_6b2.bin"
 #define FILE_MAX             (4 * 1024 * 1024)
 #define ALIVE_TIMEOUT_MS     3000
 #define PMIC_WAIT_S          60
 
 #define RAW_W                3280
 #define RAW_H                2458
-#define RAW_BYTES            (RAW_W * RAW_H * 2)
+#define FRONT_W              1936
+#define FRONT_H              1090
+#define RAW_BYTES            (RAW_W * RAW_H * 2)          // the larger (rear) frame; also holds the front one
 #define BLACK                65                 // RAW10 black level (64) + 1 so the noise floor does not count as signal
 
 #define OUT_W                640
@@ -68,6 +71,13 @@ typedef struct {
   ULONG              FwSize;
   PUCHAR             Setfile;
   ULONG              SetfileSize;
+  PUCHAR             SetfileFront;
+  ULONG              SetfileFrontSize;
+  BOOLEAN            Front;              // camera of the open pin: FALSE rear IMX134, TRUE front S5K6B2
+  UINTN              CsisBase[2];        // [0] CSIS0 / [1] CSIS1 mappings
+  UINTN              FliteBase[2];       // FIMC-Lite A / B
+  ULONG              RawW, RawH;         // raw frame size of the camera in use
+  ULONG              CropX, CropW;       // 4:3 window of it that is scaled to OUT_W x OUT_H
   PUSHORT            Raw;                // RAW_BYTES, non-cached, DMA target
   PHYSICAL_ADDRESS   RawPa;
   PUCHAR             Work;               // YUY2 being converted
@@ -300,10 +310,10 @@ ISqrt (ULONG N)
 // One RGGB quad at even (X, Y) of the raw frame; levels 0..1023 above black.
 //
 static __inline VOID
-Quad (volatile PUCHAR Raw, ULONG X, ULONG Y, LONG *R, LONG *G, LONG *B)
+Quad (volatile PUCHAR Raw, ULONG Stride, ULONG X, ULONG Y, LONG *R, LONG *G, LONG *B)
 {
-  volatile ULONG  *Row0 = (volatile ULONG *)(Raw + ((SIZE_T)Y * RAW_W + X) * 2);
-  volatile ULONG  *Row1 = (volatile ULONG *)(Raw + ((SIZE_T)(Y + 1) * RAW_W + X) * 2);
+  volatile ULONG  *Row0 = (volatile ULONG *)(Raw + ((SIZE_T)Y * Stride + X) * 2);
+  volatile ULONG  *Row1 = (volatile ULONG *)(Raw + ((SIZE_T)(Y + 1) * Stride + X) * 2);
   ULONG           W0 = *Row0;
   ULONG           W1 = *Row1;
   LONG            Rr = (LONG)(W0 & 0xFFFF) - BLACK;
@@ -339,7 +349,7 @@ Convert (PCAM_DEV D)
   //
   for (GY = 0; GY < 60; GY++) {
     for (GX = 0; GX < 80; GX++) {
-      Quad (Raw, (((GX * 8) * RAW_W) / OUT_W) & ~1u, (((GY * 8) * RAW_H) / OUT_H) & ~1u, &R, &G, &B);
+      Quad (Raw, D->RawW, (D->CropX + ((GX * 8) * D->CropW) / OUT_W) & ~1u, (((GY * 8) * D->RawH) / OUT_H) & ~1u, &R, &G, &B);
       SumR += (ULONG)R;
       SumG += (ULONG)G;
       SumB += (ULONG)B;
@@ -363,15 +373,15 @@ Convert (PCAM_DEV D)
   KB    = (Expo * GainB) >> 8;
 
   for (Y = 0; Y < OUT_H; Y++) {
-    ULONG  SrcY = ((Y * RAW_H) / OUT_H) & ~1u;
+    ULONG  SrcY = ((Y * D->RawH) / OUT_H) & ~1u;
 
     for (X = 0; X < OUT_W; X += 2) {
       LONG   R0, G0, B0, R1, G1, B1;
       ULONG  Y0, Y1, U, V, R8[2], G8[2], B8[2];
       ULONG  Index;
 
-      Quad (Raw, ((X * RAW_W) / OUT_W) & ~1u, SrcY, &R0, &G0, &B0);
-      Quad (Raw, (((X + 1) * RAW_W) / OUT_W) & ~1u, SrcY, &R1, &G1, &B1);
+      Quad (Raw, D->RawW, (D->CropX + (X * D->CropW) / OUT_W) & ~1u, SrcY, &R0, &G0, &B0);
+      Quad (Raw, D->RawW, (D->CropX + ((X + 1) * D->CropW) / OUT_W) & ~1u, SrcY, &R1, &G1, &B1);
 
       Lin = (ULONG)((R0 * KR) >> 8);  R8[0] = D->Gamma[(Lin > 1023) ? 1023 : Lin];
       Lin = (ULONG)((G0 * KG) >> 8);  G8[0] = D->Gamma[(Lin > 1023) ? 1023 : Lin];
@@ -451,8 +461,8 @@ HwTry (PCAM_DEV D)
   D->Board.PmicContext = D;
   D->Is.SensorI2cFail  = FALSE;
   LogBoard (D, "module before");
-  if (CamRearPowerOn (&D->Board) != 0) {
-    OsLog ("exynoscam: module power failed at step %lu", D->Board.Step);
+  if ((D->Front ? CamFrontPowerOn (&D->Board) : CamRearPowerOn (&D->Board)) != 0) {
+    OsLog ("exynoscam: %s module power failed at step %lu", D->Front ? "front" : "rear", D->Board.Step);
     return -1;
   }
   Delay (30);                                   // rails and MCLK settle before the A5 talks to the sensor
@@ -471,8 +481,9 @@ HwTry (PCAM_DEV D)
     OsLog ("exynoscam: A5 did not report in %u ms", ALIVE_TIMEOUT_MS);
     goto Fail;
   }
-  if ((FimcIsOpenRearSensor (&D->Is, FIMC_IS_GROUP_3A0) != 0) ||
-      (FimcIsLoadSetfile (&D->Is, FIMC_IS_GROUP_3A0, D->Setfile, D->SetfileSize) != 0)) {
+  if (((D->Front ? FimcIsOpenFrontSensor (&D->Is, FIMC_IS_GROUP_3A0) : FimcIsOpenRearSensor (&D->Is, FIMC_IS_GROUP_3A0)) != 0) ||
+      (FimcIsLoadSetfile (&D->Is, FIMC_IS_GROUP_3A0, D->Front ? D->SetfileFront : D->Setfile,
+                          D->Front ? D->SetfileFrontSize : D->SetfileSize) != 0)) {
     OsLog ("exynoscam: sensor open failed");
     Result = -2;
     goto Down;
@@ -485,10 +496,13 @@ HwTry (PCAM_DEV D)
     Result = 1;
     goto Down;
   }
-  D->Cap.Dphy   = 0;
-  D->Cap.Width  = RAW_W;
-  D->Cap.Height = RAW_H;
-  D->Cap.Settle = 15;
+  D->Cap.Csis   = D->CsisBase[D->Front ? 1 : 0];
+  D->Cap.Flite  = D->FliteBase[D->Front ? 1 : 0];
+  D->Cap.FliteB = D->Front;
+  D->Cap.Dphy   = D->Front ? 1 : 0;
+  D->Cap.Width  = D->RawW;
+  D->Cap.Height = D->RawH;
+  D->Cap.Settle = D->Front ? 16 : 15;
   D->Cap.Lanes  = 4;
   D->Cap.BufPa  = (UINT32)D->RawPa.QuadPart;
   CamCaptureConfigure (&D->Cap);
@@ -509,10 +523,13 @@ HwTry (PCAM_DEV D)
 
     D->Sensor.Gpio = D->Board.GpioLb;
     D->Sensor.Bank = 0x40;                 // GPF0
-    D->Sensor.Sda  = 0;                    // ISP I2C0 = GPF0(0/1)
-    D->Sensor.Scl  = 1;
+    D->Sensor.Sda  = D->Front ? 4 : 0;     // ISP I2C2 = GPF0(4/5) front, I2C0 = GPF0(0/1) rear
+    D->Sensor.Scl  = D->Front ? 5 : 1;
     D->AeOn        = FALSE;
-    for (Addr = 0x1A; Addr < 0x78; Addr = (Addr == 0x1A) ? 0x08 : ((Addr == 0x19) ? 0x78 : Addr + 1)) {
+    for (Addr = D->Front ? 0x35 : 0x1A; ; Addr = (Addr == (D->Front ? 0x35 : 0x1A)) ? 0x08 : Addr + 1) {
+      if (Addr >= 0x78) {
+        break;
+      }
       D->Sensor.Addr = Addr;
       if (CamI2cRead (&D->Sensor, 0x0000, &V8) == 0) {
         D->AeOn = TRUE;
@@ -522,7 +539,7 @@ HwTry (PCAM_DEV D)
     if (D->AeOn) {
       CamI2cRead16 (&D->Sensor, 0x0340, (UINT16 *)&Frame);
       if (Frame > 100) {
-        CamAeInit (&D->Ae, (ULONG)Frame - 6, 150, CAM_AE_IMX134);
+        CamAeInit (&D->Ae, (ULONG)Frame - 6, 150, D->Front ? CAM_AE_S5K6B2 : CAM_AE_IMX134);
         OsLog ("exynoscam: sensor I2C at 0x%02x, frame length %lu: auto exposure on", D->Sensor.Addr, (ULONG)Frame);
       } else {
         D->AeOn = FALSE;
@@ -541,7 +558,11 @@ Down:
   FimcIsCommand (&D->Is, "power down", HIC_POWER_DOWN, 0, 0, 0, 0, 0, NULL);
 Fail:
   FimcIsPowerDown (&D->Is);
-  CamRearPowerOff (&D->Board);
+  if (D->Front) {
+    CamFrontPowerOff (&D->Board);
+  } else {
+    CamRearPowerOff (&D->Board);
+  }
   return Result;
 }
 
@@ -552,6 +573,10 @@ HwUp (PCAM_DEV D)
   ULONG   Attempt;
   INTN    Result;
 
+  D->RawW  = D->Front ? FRONT_W : RAW_W;
+  D->RawH  = D->Front ? FRONT_H : RAW_H;
+  D->CropW = D->Front ? ((FRONT_H * 4 / 3) & ~1u) : RAW_W;
+  D->CropX = D->Front ? (((FRONT_W - D->CropW) / 2) & ~1u) : 0;
   for (Second = 0; !ExPmicConnect (&D->Pmic); Second++) {
     if (D->Stop || (Second >= PMIC_WAIT_S)) {
       OsLog ("exynoscam: exynospmic not there after %lu s", Second);
@@ -584,7 +609,11 @@ HwDown (PCAM_DEV D)
   CamCaptureStop (&D->Cap);
   FimcIsCommand (&D->Is, "power down", HIC_POWER_DOWN, 0, 0, 0, 0, 0, NULL);
   FimcIsPowerDown (&D->Is);
-  CamRearPowerOff (&D->Board);
+  if (D->Front) {
+    CamFrontPowerOff (&D->Board);
+  } else {
+    CamRearPowerOff (&D->Board);
+  }
   D->HwUp = FALSE;
   OsLog ("exynoscam: sensor off (%lu frames)", D->Frames);
 }
@@ -810,20 +839,28 @@ PinIntersect (
   return STATUS_SUCCESS;
 }
 
+static const KSFILTER_DESCRIPTOR  mFilterFront;      // defined with the filter descriptors below
+
 static
 NTSTATUS
 PinCreate (PKSPIN Pin, PIRP Irp)
 {
   PCAM_DEV  D = (PCAM_DEV)KsPinGetDevice (Pin)->Context;
+  PKSFILTER Filter = KsPinGetParentFilter (Pin);
 
   UNREFERENCED_PARAMETER (Irp);
+  if (D->Pin != NULL) {
+    OsLog ("exynoscam: pin refused, the other camera is in use");
+    return STATUS_DEVICE_BUSY;                // one camera at a time: they share the A5
+  }
+  D->Front     = (Filter->Descriptor == &mFilterFront);
   Pin->Context = D;
   D->Pin       = Pin;
   D->Delivered = 0;
   if ((Pin->ConnectionFormat != NULL) && (Pin->ConnectionFormat->FormatSize >= sizeof (KS_DATAFORMAT_VIDEOINFOHEADER))) {
     KS_DATAFORMAT_VIDEOINFOHEADER  *F = (KS_DATAFORMAT_VIDEOINFOHEADER *)Pin->ConnectionFormat;
 
-    OsLog ("exynoscam: pin created, format %lux%ld fourcc %08lx, %lu bytes, sample size %lu", (ULONG)F->VideoInfoHeader.bmiHeader.biWidth,
+    OsLog ("exynoscam: %s pin created, format %lux%ld fourcc %08lx, %lu bytes, sample size %lu", D->Front ? "front" : "rear", (ULONG)F->VideoInfoHeader.bmiHeader.biWidth,
            F->VideoInfoHeader.bmiHeader.biHeight, F->DataFormat.SubFormat.Data1, F->VideoInfoHeader.bmiHeader.biSizeImage,
            F->DataFormat.SampleSize);
   } else {
@@ -1020,6 +1057,28 @@ static const KSFILTER_DESCRIPTOR  mFilter = {
 };
 
 //
+// The front camera: same filter shape, its own factory ("FRONT"), told apart in PinCreate by its descriptor.
+//
+static const KSFILTER_DESCRIPTOR  mFilterFront = {
+  NULL,                         // dispatch
+  NULL,                         // automation
+  KSFILTER_DESCRIPTOR_VERSION,
+  0,
+  &KSCATEGORY_VIDEO,            // ReferenceGuid
+  1,
+  sizeof (KSPIN_DESCRIPTOR_EX),
+  mPins,
+  3,
+  mCategories,
+  0,
+  sizeof (KSNODE_DESCRIPTOR),
+  NULL,
+  0,
+  NULL,
+  NULL
+};
+
+//
 // ---------------------------------------------------------------------------
 // AVStream: device
 // ---------------------------------------------------------------------------
@@ -1051,7 +1110,12 @@ DevAdd (PKSDEVICE Device)
   }
   Status = KsCreateFilterFactory (Device->FunctionalDeviceObject, &mFilter, L"GLOBAL", NULL, KSCREATE_ITEM_FREEONSTOP,
                                   NULL, NULL, NULL);
-  OsLog ("exynoscam: device added, filter factory - 0x%08lx", Status);
+  OsLog ("exynoscam: device added, rear filter factory - 0x%08lx", Status);
+  if (NT_SUCCESS (Status)) {
+    Status = KsCreateFilterFactory (Device->FunctionalDeviceObject, &mFilterFront, L"FRONT", NULL, KSCREATE_ITEM_FREEONSTOP,
+                                    NULL, NULL, NULL);
+    OsLog ("exynoscam: front filter factory - 0x%08lx", Status);
+  }
   return Status;
 }
 
@@ -1095,11 +1159,15 @@ DevStart (
   D->Board.GpioLb = (UINTN)MapPhys (CAM_GPIO_LB_PHYS, 0x1000);
   D->Board.GpioB  = (UINTN)MapPhys (CAM_GPIO_B_PHYS, 0x1000);
   D->Board.CmuTop = (UINTN)MapPhys (CAM_CMU_TOP_PHYS, 0x1000);
-  D->Cap.Csis     = (UINTN)MapPhys (CAM_CSIS0_PHYS, 0x1000);
-  D->Cap.Flite    = (UINTN)MapPhys (CAM_FLITE_A_PHYS, 0x1000);
+  D->Board.GpioRt = (UINTN)MapPhys (CAM_GPIO_RT_PHYS, 0x1000);
+  D->CsisBase[0]  = (UINTN)MapPhys (CAM_CSIS0_PHYS, 0x1000);
+  D->CsisBase[1]  = (UINTN)MapPhys (CAM_CSIS1_PHYS, 0x1000);
+  D->FliteBase[0] = (UINTN)MapPhys (CAM_FLITE_A_PHYS, 0x1000);
+  D->FliteBase[1] = (UINTN)MapPhys (CAM_FLITE_B_PHYS, 0x1000);
   D->Cap.Pmu      = D->Is.Pmu;
   if ((D->Is.Is == 0) || (D->Is.Pmu == 0) || (D->Is.Cmu == 0) || (D->Is.Sysreg == 0) || (D->Board.GpioLb == 0) ||
-      (D->Board.GpioB == 0) || (D->Board.CmuTop == 0) || (D->Cap.Csis == 0) || (D->Cap.Flite == 0)) {
+      (D->Board.GpioB == 0) || (D->Board.GpioRt == 0) || (D->Board.CmuTop == 0) || (D->CsisBase[0] == 0) ||
+      (D->CsisBase[1] == 0) || (D->FliteBase[0] == 0) || (D->FliteBase[1] == 0)) {
     OsLog ("exynoscam: register windows missing (IS %p)", (PVOID)D->Is.Is);
     return STATUS_DEVICE_CONFIGURATION_ERROR;
   }
@@ -1111,6 +1179,10 @@ DevStart (
   if (NT_SUCCESS (Status)) {
     Status = LoadFile (SETFILE_PATH, &D->Setfile, &D->SetfileSize);
     OsLog ("exynoscam: setfile %lu bytes - 0x%08lx", D->SetfileSize, Status);
+    if (NT_SUCCESS (Status)) {
+      Status = LoadFile (SETFILE_FRONT_PATH, &D->SetfileFront, &D->SetfileFrontSize);
+      OsLog ("exynoscam: front setfile %lu bytes - 0x%08lx", D->SetfileFrontSize, Status);
+    }
   }
   if (!NT_SUCCESS (Status)) {
     return Status;
@@ -1150,8 +1222,15 @@ Teardown (PCAM_DEV D)
   if (D->Board.GpioLb != 0) { MmUnmapIoSpace ((PVOID)D->Board.GpioLb, 0x1000); D->Board.GpioLb = 0; }
   if (D->Board.GpioB != 0) { MmUnmapIoSpace ((PVOID)D->Board.GpioB, 0x1000); D->Board.GpioB = 0; }
   if (D->Board.CmuTop != 0) { MmUnmapIoSpace ((PVOID)D->Board.CmuTop, 0x1000); D->Board.CmuTop = 0; }
-  if (D->Cap.Csis != 0) { MmUnmapIoSpace ((PVOID)D->Cap.Csis, 0x1000); D->Cap.Csis = 0; }
-  if (D->Cap.Flite != 0) { MmUnmapIoSpace ((PVOID)D->Cap.Flite, 0x1000); D->Cap.Flite = 0; }
+  {
+    ULONG  I;
+
+    for (I = 0; I < 2; I++) {
+      if (D->CsisBase[I] != 0) { MmUnmapIoSpace ((PVOID)D->CsisBase[I], 0x1000); D->CsisBase[I] = 0; }
+      if (D->FliteBase[I] != 0) { MmUnmapIoSpace ((PVOID)D->FliteBase[I], 0x1000); D->FliteBase[I] = 0; }
+    }
+    if (D->Board.GpioRt != 0) { MmUnmapIoSpace ((PVOID)D->Board.GpioRt, 0x1000); D->Board.GpioRt = 0; }
+  }
   if (D->Is.MemVa != NULL) {
     MmFreeContiguousMemorySpecifyCache (D->Is.MemVa, FIMC_IS_A5_MEM_SIZE, MmNonCached);
     D->Is.MemVa = NULL;
@@ -1161,6 +1240,7 @@ Teardown (PCAM_DEV D)
   if (D->Latest != NULL) { ExFreePoolWithTag (D->Latest, CAM_TAG); D->Latest = NULL; }
   if (D->Fw != NULL) { ExFreePoolWithTag (D->Fw, CAM_TAG); D->Fw = NULL; }
   if (D->Setfile != NULL) { ExFreePoolWithTag (D->Setfile, CAM_TAG); D->Setfile = NULL; }
+  if (D->SetfileFront != NULL) { ExFreePoolWithTag (D->SetfileFront, CAM_TAG); D->SetfileFront = NULL; }
 }
 
 static

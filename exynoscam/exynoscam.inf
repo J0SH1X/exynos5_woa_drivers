@@ -21,6 +21,7 @@ DefaultDestDir = 12
 exynoscam.sys = 1
 fimc_is_fw2_IMX134.bin = 1
 setfile_imx134.bin = 1
+setfile_6b2.bin = 1
 
 [Manufacturer]
 %Mfg% = Devices, NTARM
@@ -37,11 +38,15 @@ CopyFiles = Files
 exynoscam.sys
 fimc_is_fw2_IMX134.bin
 setfile_imx134.bin
+setfile_6b2.bin
 
 [Install.NT.Interfaces]
 AddInterface = %KSCATEGORY_CAPTURE%,      %KSNAME_Filter%, Cam.Interface
 AddInterface = %KSCATEGORY_VIDEO%,        %KSNAME_Filter%, Cam.Interface
 AddInterface = %KSCATEGORY_VIDEO_CAMERA%, %KSNAME_Filter%, Cam.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,      %KSNAME_FilterFront%, Cam.Interface.Front
+AddInterface = %KSCATEGORY_VIDEO%,        %KSNAME_FilterFront%, Cam.Interface.Front
+AddInterface = %KSCATEGORY_VIDEO_CAMERA%, %KSNAME_FilterFront%, Cam.Interface.Front
 
 [Cam.Interface]
 AddReg = Cam.Interface.AddReg
@@ -49,6 +54,13 @@ AddReg = Cam.Interface.AddReg
 [Cam.Interface.AddReg]
 HKR,,CLSID,,%ProxyVCap.CLSID%
 HKR,,FriendlyName,,%CameraName%
+
+[Cam.Interface.Front]
+AddReg = Cam.Interface.Front.AddReg
+
+[Cam.Interface.Front.AddReg]
+HKR,,CLSID,,%ProxyVCap.CLSID%
+HKR,,FriendlyName,,%CameraFrontName%
 
 [Install.NT.Services]
 AddService = exynoscam, 0x00000002, Service
@@ -65,6 +77,8 @@ Mfg         = "Samsung"
 Disk        = "Exynos5420 drivers"
 DeviceDesc  = "Exynos5 camera (FIMC-IS)"
 CameraName  = "Exynos5 rear camera"
+CameraFrontName = "Exynos5 front camera"
+KSNAME_FilterFront      = "FRONT"
 KSNAME_Filter           = "GLOBAL"
 KSCATEGORY_CAPTURE      = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_VIDEO        = "{6994AD05-93EF-11D0-A3CC-00A0C9223196}"
