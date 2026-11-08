@@ -8,6 +8,7 @@ Signature   = "$WINDOWS NT$"
 Class       = SCSIAdapter
 ClassGuid   = {4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider    = %Provider%
+BootCritical = 1
 DriverVer   = 10/31/2026,1.0.0.0
 
 [SourceDisksNames]
@@ -27,6 +28,7 @@ DefaultDestDir = 12
 
 [Install.NT]
 CopyFiles = Files
+AddReg    = CDD_AddReg
 
 [Files]
 exynosemmc.sys
@@ -41,6 +43,12 @@ ErrorControl   = 1
 ServiceBinary  = %12%\exynosemmc.sys
 LoadOrderGroup = SCSI miniport
 AddReg         = Service_AddReg
+
+[CDD_AddReg]
+HKLM, "SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#exyn5007", "Service",   0x00000000, "exynosemmc"
+HKLM, "SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#exyn5007", "ClassGUID", 0x00000000, "{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM, "SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#ven_exyn&dev_5007", "Service",   0x00000000, "exynosemmc"
+HKLM, "SYSTEM\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#ven_exyn&dev_5007", "ClassGUID", 0x00000000, "{4D36E97B-E325-11CE-BFC1-08002BE10318}"
 
 [Service_AddReg]
 ; Storport: this miniport handles PnP devices of interface type Internal (0),

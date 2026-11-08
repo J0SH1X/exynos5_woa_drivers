@@ -14,7 +14,8 @@
 
   - HwFindAdapter (PASSIVE): map dw_mmc0 (its access range if Storport
     hands one to a virtual miniport, otherwise the known address), reset
-    the host and identify the eMMC (CMD0 .. user area, 8-bit, 20 MHz).
+    the host and identify the eMMC (CMD0 .. user area, 8-bit, 20 MHz), then
+    switch it to the fastest bus mode it passes (HS200, else HS52).
   - HwStartIo (DISPATCH) only queues requests; a Storport worker runs them
     at PASSIVE level, polling the controller like UEFI does, and completes
     them.  No interrupt.
@@ -175,6 +176,56 @@ ScsiModeSense (PSCSI_REQUEST_BLOCK Srb, BOOLEAN Ten)
 }
 
 /**
+  The controller's clocks stay as UEFI left them (sclk_dwmci0 = CPLL / 1 and
+  CLKSEL / 4 = 166.5 MHz CIU): HS52 and HS200 need no CMU change, the MMC
+  core only wants the CIU rate back.  HS400 would (not supported here).
+**/
+static EFI_STATUS
+EFIAPI
+SourceClock (MMC_HOST *Host, MMC_SPEED Speed, UINT32 ClkSel, UINT32 *CiuHz)
+{
+  UNREFERENCED_PARAMETER (Host);
+  UNREFERENCED_PARAMETER (ClkSel);
+
+  if ((Speed != MmcSpeedDefault) && (Speed != MmcSpeedHs) && (Speed != MmcSpeedHs200)) {
+    return EFI_UNSUPPORTED;
+  }
+  *CiuHz = DWMCI_CIU_HZ;
+  return EFI_SUCCESS;
+}
+
+#define HS200_SAMPLE_PHASE  3        // middle of the passing window 0..6 found in UEFI (EmmcTest, 8 phases x 8 drives)
+
+/**
+  Fastest bus mode the card passes: HS200 (8-bit SDR at 166.5 MHz, sample
+  phase from the UEFI scan), else HS52.  The shared MmcCore proves each by
+  reading LBA 0 and EXT_CSD and resets the card back to the default speed
+  when a mode fails.  Measured in UEFI (EmmcTest): default 14 / 11 MB/s
+  read / write, HS52 31 / 18.6, HS200 80 / 26; 3000 random read/write
+  operations verified in HS52 and HS200.
+**/
+static VOID
+SelectHighSpeed (PDEVICE_EXTENSION Dev)
+{
+  EFI_STATUS  Status;
+
+#ifndef EMMC_HIGH_SPEED
+  UNREFERENCED_PARAMETER (Dev);
+  UNREFERENCED_PARAMETER (Status);
+  return;                           // slow mode: stay at the default 20 MHz
+#endif
+  Dev->Host.SetSourceClock = SourceClock;
+  Dev->Host.SamplePhase    = HS200_SAMPLE_PHASE;
+  Status = MmcSetSpeed (&Dev->Host, MmcSpeedHs200);
+  if (EFI_ERROR (Status)) {
+    OsLog ("exynosemmc: HS200 failed - 0x%08Ix, trying HS52", Status);
+    Status = MmcSetSpeed (&Dev->Host, MmcSpeedHs);
+  }
+  OsLog ("exynosemmc: bus speed mode %lu (0 default, 1 HS52, 4 HS200) - 0x%08Ix, card clock %lu Hz, CIU %lu Hz",
+         (ULONG)Dev->Host.Speed, Status, Dev->Host.ClockHz, Dev->Host.MaxClockHz);
+}
+
+/**
   The card sometimes stops answering mid-session (every command, CMD13
   included, times out: it has lost its RCA, as after a reset).  Bring it
   back like at boot: controller FIFO / DMA reset, 400 kHz 1-bit, then the
@@ -200,6 +251,9 @@ RecoverCard (PDEVICE_EXTENSION Dev)
   Status = MmcInitCard (&Dev->Host, TRUE);
   OsLog ("exynosemmc: card stopped answering, re-init #%lu - 0x%08Ix (%lu-bit)", Dev->Recoveries, Status,
          Dev->Host.Card.BusWidth);
+  if (!EFI_ERROR (Status)) {
+    SelectHighSpeed (Dev);          // the reset put the card back to the default speed
+  }
   return !EFI_ERROR (Status);
 }
 
@@ -538,6 +592,7 @@ HwFindAdapter (PVOID DeviceExtension, PVOID HwContext, PVOID BusInformation, PVO
   }
   OsLog ("exynosemmc: eMMC ready, %I64u blocks (%I64u MiB), %lu-bit",
          Dev->Host.Card.BlockCount, Dev->Host.Card.BlockCount >> 11, Dev->Host.Card.BusWidth);
+  SelectHighSpeed (Dev);
 
   ConfigInfo->VirtualDevice               = TRUE;
   ConfigInfo->MaximumTransferLength       = MAX_TRANSFER_BLOCKS * BLOCK_SIZE;

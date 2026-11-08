@@ -42,6 +42,7 @@ typedef UINTN               EFI_STATUS;
 #define EFI_OUT_OF_RESOURCES   EFI_ENCODE_ERROR (9)
 #define EFI_NO_MEDIA           EFI_ENCODE_ERROR (12)
 #define EFI_TIMEOUT            EFI_ENCODE_ERROR (18)
+#define EFI_UNSUPPORTED        EFI_ENCODE_ERROR (3)
 #define EFI_CRC_ERROR          EFI_ENCODE_ERROR (27)
 #define EFI_ERROR(s)           (((INTN)(s)) < 0)
 
