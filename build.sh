@@ -91,6 +91,10 @@ WDM=1 ./build-driver.sh exynosaudio exynosaudio/adapter.cpp exynosaudio/wave.cpp
 # UEFI tree (../uefi/Exynos5420Pkg/Drivers/SdCardDxe) against exynosemmc/MmcEnv.h.
 WDM=1 ./build-driver.sh exynosemmc exynosemmc/exynosemmc.c exynosemmc/mmccore.c exynosemmc/dwmci.c -- \
   "$LIB/storport.lib" "$LIB/ntstrsafe.lib"
+# The same for the removable microSD slot (dw_mmc channel 2, card detect +
+# slot power done by the driver, since UEFI leaves an empty slot untouched).
+WDM=1 ./build-driver.sh exynossd exynossd/exynossd.c exynossd/mmccore.c exynossd/dwmci.c -- \
+  "$LIB/storport.lib" "$LIB/ntstrsafe.lib"
 
 SIGN=${SIGN:-$HOME/s2/winsdk/testsign/testsign}
 
@@ -100,7 +104,7 @@ BUILD=$(( $(cat .buildnum 2>/dev/null || echo 0) + 1 ))
 echo "$BUILD" > .buildnum
 DATE=$(date +%m/%d/%Y)
 
-for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynoswifi exynosemmc bma255 bmg160 ak8963 cm3323 exynosdisp2 exynoswddm exynosuart exynosbt exynosgpu exynoscam exynospmic; do
+for d in exynosdwc3 exynosi2c exynosgpio exynosspi exynosaudio mxt1664s wacomg9 exynosbtn exynosbatt exynoswlan exynoswifi exynosemmc exynossd bma255 bmg160 ak8963 cm3323 exynosdisp2 exynoswddm exynosuart exynosbt exynosgpu exynoscam exynospmic; do
   mkdir -p "Artifacts/$d"
   cp "$d/build/$d.sys" "Artifacts/$d/"
   # Bluetooth patch files from the stock image (not in the tree).
