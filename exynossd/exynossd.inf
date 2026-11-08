@@ -1,0 +1,57 @@
+; microSD slot (Exynos5420 dw_mmc2, v1awifi SM-P900) as a Storport disk, Windows RT 8.1.
+; Demand start: the card is optional, and the system never boots from it.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:exynossd.inf /ForceUnsigned
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = SCSIAdapter
+ClassGuid   = {4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider    = %Provider%
+DriverVer   = 11/08/2026,1.0.0.0
+
+[SourceDisksNames]
+1 = %Disk%
+
+[SourceDisksFiles]
+exynossd.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%Mfg% = Devices, NTARM
+
+[Devices.NTARM]
+%DeviceDesc% = Install, ACPI\EXYN5017
+
+[Install.NT]
+CopyFiles = Files
+
+[Files]
+exynossd.sys
+
+[Install.NT.Services]
+AddService = exynossd, 0x00000002, Service
+
+[Service]
+ServiceType    = 1              ; SERVICE_KERNEL_DRIVER
+StartType      = 3              ; SERVICE_DEMAND_START: nothing boots from the card
+ErrorControl   = 1
+ServiceBinary  = %12%\exynossd.sys
+LoadOrderGroup = SCSI miniport
+AddReg         = Service_AddReg
+
+[Service_AddReg]
+; Storport: this miniport handles PnP devices of interface type Internal (0),
+; PNPBus (15) and ACPIBus (17).
+HKR, "Parameters\PnpInterface", "0", 0x00010001, 0x00000001
+HKR, "Parameters\PnpInterface", "15", 0x00010001, 0x00000001
+HKR, "Parameters\PnpInterface", "17", 0x00010001, 0x00000001
+
+[Strings]
+Provider   = "Exynos5420"
+Mfg        = "Samsung"
+Disk       = "Exynos5420 drivers"
+DeviceDesc = "Exynos5 microSD (Storport)"
