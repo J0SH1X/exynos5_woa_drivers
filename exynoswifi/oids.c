@@ -582,6 +582,9 @@ Set (PADAPTER A, PNDIS_OID_REQUEST Req)
   NDIS_STATUS             Status;
 
   switch (Oid) {
+    case OID_802_3_MULTICAST_LIST:
+      Req->DATA.SET_INFORMATION.BytesRead = Length;
+      return NDIS_STATUS_SUCCESS;
     case OID_GEN_CURRENT_PACKET_FILTER:   return TakeValue (Req, &A->PacketFilter, 4);
     case OID_GEN_CURRENT_LOOKAHEAD:       return TakeValue (Req, &A->Lookahead, 4);
     case OID_GEN_LINK_PARAMETERS:
@@ -995,8 +998,13 @@ OidRequest (PADAPTER A, PNDIS_OID_REQUEST Req)
     case NdisRequestQueryInformation:
     case NdisRequestQueryStatistics:
       return Query (A, Req);
-    case NdisRequestSetInformation:
-      return Set (A, Req);
+    case NdisRequestSetInformation: {
+      NDIS_STATUS  St = Set (A, Req);
+      if (St != NDIS_STATUS_SUCCESS && St != NDIS_STATUS_PENDING) {
+        OsLog ("exynoswifi: set OID 0x%08lx -> 0x%08lx", Req->DATA.SET_INFORMATION.Oid, (ULONG)St);
+      }
+      return St;
+    }
     case NdisRequestMethod:
       if (Req->DATA.METHOD_INFORMATION.Oid == OID_DOT11_ENUM_BSS_LIST) {
         return QueryBssList (A, Req->DATA.METHOD_INFORMATION.InformationBuffer,

@@ -1329,6 +1329,28 @@ JoinSucceeded (PADAPTER A)
   P->uBeaconSize = Pos - P->uBeaconOffset;
   Pos = (Pos + 7) & ~7u;
 
+  //
+  // nwifi may not have told us the group cipher: take it from the RSN IE
+  // the AP advertises (00-0F-AC:2 TKIP, :4 CCMP), else follow the pairwise one.
+  //
+  if (A->MulticastCipher == DOT11_CIPHER_ALGO_NONE && A->UnicastCipher != DOT11_CIPHER_ALGO_NONE) {
+    ULONG  BeaconIe = P->uBeaconOffset + 12;
+    ULONG  End = P->uBeaconOffset + P->uBeaconSize;
+    A->MulticastCipher = A->UnicastCipher;
+    while (BeaconIe + 2 <= End && BeaconIe + 2 + B[BeaconIe + 1] <= End) {
+      if (B[BeaconIe] == 0x30 && B[BeaconIe + 1] >= 8 &&
+          B[BeaconIe + 4] == 0x00 && B[BeaconIe + 5] == 0x0F && B[BeaconIe + 6] == 0xAC) {
+        if (B[BeaconIe + 7] == 2) {
+          A->MulticastCipher = DOT11_CIPHER_ALGO_TKIP;
+        } else if (B[BeaconIe + 7] == 4) {
+          A->MulticastCipher = DOT11_CIPHER_ALGO_CCMP;
+        }
+        break;
+      }
+      BeaconIe += 2 + B[BeaconIe + 1];
+    }
+    OsLog ("exynoswifi: group cipher %lu (from the AP)", (ULONG)A->MulticastCipher);
+  }
   P->AuthAlgo        = A->AuthAlgorithm;
   P->UnicastCipher   = A->UnicastCipher;
   P->MulticastCipher = A->MulticastCipher;
