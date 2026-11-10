@@ -24,7 +24,7 @@ typedef enum {
   T_UpdateActiveVidPnPresentPath, T_RecommendMonitorModes, T_GetScanLine, T_QueryVidPnHWCapability,
   T_CreateDevice, T_CreateContext, T_CreateAllocation, T_DestroyAllocation, T_DescribeAllocation,
   T_GetStandardAllocationDriverData, T_OpenAllocation, T_CloseAllocation, T_BuildPagingBuffer,
-  T_Render, T_Present, T_Patch, T_SubmitCommand, T_PreemptCommand, T_QueryCurrentFence,
+  T_Render, T_RenderKm, T_Present, T_Patch, T_SubmitCommand, T_PreemptCommand, T_QueryCurrentFence,
   T_CollectDbgInfo, T_Escape, T_SetPalette, T_SetVidPnSourceAddress, T_RecommendVidPnTopology,
   T_StopCapture, T_AcquireSwizzlingRange, T_ReleaseSwizzlingRange, T_QueryDependentEngineGroup,
   T_QueryEngineStatus, T_ResetEngine, T_CancelCommand,
@@ -38,7 +38,7 @@ static const char * const  mName[T_COUNT] = {
   "UpdateActiveVidPnPresentPath", "RecommendMonitorModes", "GetScanLine", "QueryVidPnHWCapability",
   "CreateDevice", "CreateContext", "CreateAllocation", "DestroyAllocation", "DescribeAllocation",
   "GetStandardAllocationDriverData", "OpenAllocation", "CloseAllocation", "BuildPagingBuffer",
-  "Render", "Present", "Patch", "SubmitCommand", "PreemptCommand", "QueryCurrentFence",
+  "Render", "RenderKm", "Present", "Patch", "SubmitCommand", "PreemptCommand", "QueryCurrentFence",
   "CollectDbgInfo", "Escape", "SetPalette", "SetVidPnSourceAddress", "RecommendVidPnTopology",
   "StopCapture", "AcquireSwizzlingRange", "ReleaseSwizzlingRange", "QueryDependentEngineGroup",
   "QueryEngineStatus", "ResetEngine", "CancelCommand",
@@ -75,6 +75,7 @@ Detail (DDI_ID Id, PVOID Arg, ULONG *D0, ULONG *D1)
       *D1 = ((DXGKARG_PRESENT *)Arg)->DmaSize;
       break;
     case T_Render:
+    case T_RenderKm:
       *D0 = ((DXGKARG_RENDER *)Arg)->CommandLength;
       *D1 = ((DXGKARG_RENDER *)Arg)->AllocationListSize;
       break;
@@ -171,6 +172,7 @@ WRAP2 (OpenAllocation)
 WRAP2 (CloseAllocation)
 WRAP2 (BuildPagingBuffer)
 WRAP2 (Render)
+WRAP2 (RenderKm)
 WRAP2 (Present)
 WRAP2 (Patch)
 WRAP2 (SubmitCommand)
@@ -235,6 +237,7 @@ DdTraceInit (DRIVER_INITIALIZATION_DATA *Init)
   HOOK (CloseAllocation);
   HOOK (BuildPagingBuffer);
   HOOK (Render);
+  HOOK (RenderKm);
   HOOK (Present);
   HOOK (Patch);
   HOOK (SubmitCommand);

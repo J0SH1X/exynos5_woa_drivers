@@ -261,8 +261,8 @@ GiveBack (ADAPTER *A)
   A->PendingPa = 0;
   A->ScanPrimary = 0;
   A->ScanAlloc   = NULL;
-  A->ScanAllocBuf = 2;
-  A->ScanFront   = 2;
+  A->ScanAllocBuf = SCAN_NONE;
+  A->ScanFront   = SCAN_NONE;
   UnmapRegisters (A);
   if (A->Boot.Va != A->Fb) {
     FreeScanout (&A->Boot, FB_BYTES);
@@ -359,10 +359,10 @@ ExStartDeviceImpl (IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INFO Dxg
   }
   A->ScanPa    = A->Boot.Pa.LowPart;
   A->PendingPa = 0;
-  A->ScanFront = 2;
+  A->ScanFront = SCAN_NONE;
   A->ScanPrimary = 0;
   A->ScanAlloc   = NULL;
-  A->ScanAllocBuf = 2;
+  A->ScanAllocBuf = SCAN_NONE;
   Status = RenderStart (A);
   if (!NT_SUCCESS (Status)) {
     GiveBack (A);
@@ -480,7 +480,8 @@ ExInterruptRoutine (IN_CONST_PVOID MiniportDeviceContext, IN_ULONG MessageNumber
   if (A->FlipPending && (A->PendingPa != 0)) {
     A->ScanPa      = A->PendingPa;             // latched at this vsync
     A->ScanPrimary = A->PendingPrimary;        // ... and with it this primary is on screen
-    A->ScanFront   = (A->ScanPa == A->ScanBuf[0].Pa.LowPart) ? 0 : (A->ScanPa == A->ScanBuf[1].Pa.LowPart) ? 1 : 2;
+    A->ScanFront   = (A->ScanPa == A->ScanBuf[0].Pa.LowPart) ? 0 : (A->ScanPa == A->ScanBuf[1].Pa.LowPart) ? 1 :
+                     (A->ScanPa == A->ScanBuf[2].Pa.LowPart) ? 2 : SCAN_NONE;
     A->PendingPa   = 0;
     InterlockedExchange (&A->FlipPending, 0);
   }
@@ -513,9 +514,14 @@ ExResetDevice (IN_CONST_PVOID MiniportDeviceContext)
   UNREFERENCED_PARAMETER (MiniportDeviceContext);
 }
 
+static KBUGCHECK_CALLBACK_RECORD  mBugCheckRecord;
+
 static VOID APIENTRY
 ExUnload (VOID)
 {
+  // A registered bug check callback left behind makes a live driver swap bugcheck with
+  // SYSTEM_SCAN_AT_RAISED_IRQL_CAUGHT_IMPROPER_DRIVER_UNLOAD.
+  KeDeregisterBugCheckCallback (&mBugCheckRecord);
   OsLogFileStop ();
 }
 
@@ -1437,6 +1443,11 @@ ExControlInterruptImpl (IN_CONST_HANDLE hAdapter, IN_CONST_DXGK_INTERRUPT_TYPE I
     return STATUS_NOT_IMPLEMENTED;
   }
   InterlockedExchange (&A->VsyncToWindows, EnableInterrupt ? 1 : 0);
+  if (EnableInterrupt) {
+    A->VsyncOnCalls++;
+  } else {
+    A->VsyncOffCalls++;
+  }
   if (EnableInterrupt && A->PanelOn) {
     ArmVsync (A, 0);
   }
@@ -1570,7 +1581,6 @@ WddmRegister (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath, PDRIVER
 //
 __declspec(dllimport) ULONG_PTR KiBugCheckData[5];
 
-static KBUGCHECK_CALLBACK_RECORD  mBugCheckRecord;
 
 static VOID
 HexOut (char *Out, ULONG_PTR Value)
@@ -1692,6 +1702,52 @@ BugCheckCallback (PVOID Buffer, ULONG Length)
   }
 }
 
+BOOLEAN  gGdiAccel = TRUE;
+BOOLEAN  gGdiGpu = TRUE;
+
+/**
+  Service key value GdiAcceleration (REG_DWORD): 0 turns GDI hardware
+  acceleration off (no DxgkDdiRenderKm, no SupportKernelModeCommandBuffer) -
+  the way back without a rebuild if it misbehaves.
+**/
+static VOID
+ReadGdiAccel (PUNICODE_STRING RegistryPath)
+{
+  RTL_QUERY_REGISTRY_TABLE  Q[2];
+  ULONG                     Value = 1;
+  ULONG                     Default = 1;
+  WCHAR                     Path[256];
+  NTSTATUS                  Status;
+
+  if ((RegistryPath == NULL) || (RegistryPath->Buffer == NULL) ||
+      (RegistryPath->Length >= sizeof (Path) - sizeof (WCHAR))) {
+    return;
+  }
+  RtlCopyMemory (Path, RegistryPath->Buffer, RegistryPath->Length);
+  Path[RegistryPath->Length / sizeof (WCHAR)] = 0;
+  RtlZeroMemory (Q, sizeof (Q));
+  Q[0].Flags         = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+  Q[0].Name          = L"GdiGpu";
+  Q[0].EntryContext  = &Value;
+  Q[0].DefaultType   = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+  Q[0].DefaultData   = &Default;
+  Q[0].DefaultLength = sizeof (Default);
+  Status = RtlQueryRegistryValues (RTL_REGISTRY_ABSOLUTE, Path, Q, NULL, NULL);
+  gGdiGpu = (Value != 0);
+  Value = 1;
+  RtlZeroMemory (Q, sizeof (Q));
+  Q[0].Flags         = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+  Q[0].Name          = L"GdiAcceleration";
+  Q[0].EntryContext  = &Value;
+  Q[0].DefaultType   = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+  Q[0].DefaultData   = &Default;
+  Q[0].DefaultLength = sizeof (Default);
+  Status = RtlQueryRegistryValues (RTL_REGISTRY_ABSOLUTE, Path, Q, NULL, NULL);
+  gGdiAccel = (Value != 0);
+  OsLog ("exynoswddm: GDI hardware acceleration %s (GdiAcceleration %lu, query 0x%08lx), GDI on the GPU %s", gGdiAccel ? "on" : "off",
+         Value, (ULONG)Status, gGdiGpu ? "on" : "off");
+}
+
 NTSTATUS
 DriverEntry (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
@@ -1704,6 +1760,7 @@ DriverEntry (PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
   mOwnBase   = DriverObject->DriverStart;
   OsLog ("exynoswddm: loaded at %p", mOwnBase);
   KeRegisterBugCheckCallback (&mBugCheckRecord, BugCheckCallback, NULL, 0, (PUCHAR)"exynoswddm");
+  ReadGdiAccel (RegistryPath);
 
   RtlZeroMemory (&Init, sizeof (Init));
   Init.Version                               = DXGKDDI_INTERFACE_VERSION;

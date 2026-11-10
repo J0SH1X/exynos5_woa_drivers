@@ -45,7 +45,7 @@ EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E" WDM=1 ./build-dr
 # user-mode driver (exynosumd.dll, plain DLL, no CRT).
 # EXW_GPU_MODE=0: present-only (softpipe in the UMD), 1: the T628 renders (panfrost)
 EXTRA_CFLAGS="$EXTRA_CFLAGS -DDXGKDDI_INTERFACE_VERSION=0x300E -DEXW_GPU_MODE=${EXW_GPU_MODE:-1}" WDM=1 ./build-driver.sh exynoswddm \
-  exynoswddm/exynoswddm.c exynoswddm/render.c exynoswddm/cores.c exynoswddm/fimdext.c exynoswddm/ddtrace.c exynoswddm/oslogfile.c -- "$LIB/ntstrsafe.lib"
+  exynoswddm/exynoswddm.c exynoswddm/render.c exynoswddm/gdiops.c exynoswddm/gdigpu.c exynoswddm/gdigpu_build.c exynoswddm/cores.c exynoswddm/fimdext.c exynoswddm/ddtrace.c exynoswddm/oslogfile.c -- "$LIB/ntstrsafe.lib"
 ./exynosumd/build.sh
 
 # Sensors on I2C3, one HID sensor minidriver each (common/hidsensor.h,

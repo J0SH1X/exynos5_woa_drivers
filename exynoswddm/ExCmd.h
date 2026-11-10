@@ -54,6 +54,7 @@ typedef struct {
 #define EX_CMD_BLT           5       // 32 bpp rectangle copy, segment -> segment
 #define EX_CMD_COLORFILL     6       // 32 bpp rectangle fill
 #define EX_CMD_GPU_JOB       7       // Mali job chain (GPU VA), slot (later)
+#define EX_CMD_GDI           8       // GDI hardware acceleration operation (DxgkDdiRenderKm), EX_CMD_GDI_ARGS
 
 typedef struct {
   UINT32  Op;
@@ -127,6 +128,51 @@ typedef struct {
   UINT32  Slot;
   UINT32  Reserved;
 } EX_CMD_GPU_JOB_ARGS;
+
+//
+// EX_CMD_GDI: one DXGK_GDIOP_* operation over RectCount destination
+// rectangles (a DXGK_RENDERKM_COMMAND with many sub-rectangles becomes
+// several of these).  Allocations are EX_ALLOCATION pointers (kernel only:
+// built by DxgkDdiRenderKm, executed in the same driver); 0 = none.
+//
+#define EX_GDI_BITBLT          1      // DXGK_RENDERKM_OPERATION values
+#define EX_GDI_COLORFILL       2
+#define EX_GDI_ALPHABLEND      3
+#define EX_GDI_STRETCHBLT      4
+#define EX_GDI_TRANSPARENTBLT  6
+#define EX_GDI_CLEARTYPEBLEND  7
+
+#define EX_GDI_F_HASALPHA      0x1    // AlphaBlend: SourceHasAlpha
+#define EX_GDI_F_HONORALPHA    0x2    // TransparentBlt: Flags.HonorAlpha
+#define EX_GDI_F_MIRRORX       0x4    // StretchBlt
+#define EX_GDI_F_MIRRORY       0x8
+
+#define EX_GDI_MAX_RECTS       32     // rectangles per EX_CMD_GDI
+
+typedef struct {
+  EX_CMD   Hdr;
+  UINT32   GdiOp;         // EX_GDI_*
+  UINT32   RectCount;
+  UINT64   Dst;           // EX_ALLOCATION *
+  UINT64   Src;           // EX_ALLOCATION * (BitBlt / StretchBlt / AlphaBlend / TransparentBlt)
+  UINT64   Alpha;         // EX_ALLOCATION * (ClearTypeBlend: coverage)
+  UINT64   Gamma;         // EX_ALLOCATION * (ClearTypeBlend: gamma tables), 0 = none
+  UINT32   DstPitch;      // from the command (CPU-visible staging / existing sysmem), 0 = the allocation's
+  UINT32   SrcPitch;      // same for the source / the alpha surface
+  EX_RECT  SrcRect;
+  EX_RECT  DstRect;
+  UINT32   Rop;           // DXGK_GDIROP_BITBLT / DXGK_GDIROP_COLORFILL; StretchBlt: Mode
+  UINT32   Rop3;
+  UINT32   Color;
+  UINT32   Color2;        // ClearTypeBlend
+  UINT32   GammaIndex;    // ClearTypeBlend: Gamma (D3DKM_INVALID_GAMMA_INDEX = none)
+  UINT32   Flags;         // EX_GDI_F_*
+  UINT32   ConstantAlpha; // AlphaBlend
+  INT32    OffsetX;       // ClearTypeBlend: DstToAlphaOffsetX / Y
+  INT32    OffsetY;
+  UINT32   Reserved;
+  EX_RECT  Rects[1];      // RectCount destination rectangles
+} EX_CMD_GDI_ARGS;
 
 //
 // DXGKQAITYPE_UMDRIVERPRIVATE: input EX_UMD_QUERY, output EX_UMD_CAPS.

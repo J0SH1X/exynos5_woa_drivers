@@ -20,6 +20,8 @@
 #define WIDTH          EXYNOS_DISP_WIDTH
 #define HEIGHT         EXYNOS_DISP_HEIGHT
 #define FB_BYTES       ((SIZE_T)WIDTH * HEIGHT * 4)
+#define SCAN_BUFS      3              // scan-out buffers in the carve-out (GPU presents: on screen, pending, blit target)
+#define SCAN_NONE      SCAN_BUFS      // ScanFront / ScanAllocBuf: none of them (boot / firmware framebuffer)
 #define MAX_RECTS      32
 
 //
@@ -78,6 +80,9 @@ struct _EX_ALLOCATION {
   BOOLEAN                 GpuPresented;  // the UMD blits its frames into the scan-out on the GPU (no CPU copy)
   PMDL                    CpuMdl;        // partial MDL for the CPU mapping
   PUCHAR                  CpuVa;         // write-combined, while mapped (lazy)
+  BOOLEAN                 CpuCached;     // CpuVa is a cached mapping (GDI existing system memory: cached elsewhere too)
+  UCHAR                   GdiType;       // D3DKMDT_GDISURFACETYPE, 0 = not a GDI surface
+  UCHAR                   Bpp;           // GDI surfaces: bytes per pixel (4, or 1 for A8)
   PUCHAR                  Shadow;        // present-only: the creator's last published frame (paged pool)
   ULONG                   ShadowBytes;
   ULONG                   ShadowGen;
@@ -110,12 +115,14 @@ typedef struct _ADAPTER {
   volatile ULONGLONG      ScanPrimary;   // segment address of the primary on screen (0: none) - CRTC vsync reports it
   volatile ULONGLONG      PendingPrimary;
   EX_ALLOCATION * volatile ScanAlloc;    // primary on screen (blts into it are copied to the front buffer too)
-  volatile ULONG          ScanAllocBuf;  // the scan-out buffer ScanAlloc was flipped to (2: none)
-  SCANOUT                 ScanBuf[2];    // in the firmware carve-out: flipped scan-out buffers
-  ULONG                   ScanFront;     // index into ScanBuf of the buffer on screen, or 2: Boot / firmware
+  volatile ULONG          ScanAllocBuf;  // the scan-out buffer ScanAlloc was flipped to (SCAN_NONE: none)
+  SCANOUT                 ScanBuf[SCAN_BUFS]; // in the firmware carve-out: flipped scan-out buffers
+  ULONG                   ScanFront;     // index into ScanBuf of the buffer on screen, or SCAN_NONE: Boot / firmware
   volatile LONG           FlipPending;
   volatile LONG           VsyncToWindows;
   ULONG                   Vsyncs;
+  ULONG                   VsyncOnCalls;   // DxgkDdiControlInterrupt (CRTC_VSYNC) on / off
+  ULONG                   VsyncOffCalls;
   SCANOUT                 Cursor;        // 64 x 64 ARGB
   UINT32                  Shape[FIMD_CURSOR_SIZE * FIMD_CURSOR_SIZE];
   INT32                   CursorX;
@@ -153,6 +160,37 @@ typedef struct _ADAPTER {
   ULONG                   PartialMaps;
   ULONG                   ExecLogs;
   ULONG                   FragDumps;
+  ULONG                   ChainTraces;
+  ULONG                   ChainDetail;
+  ULONG                   GdiRenders;    // RenderKm calls
+  ULONG                   GdiCommands;   // DXGK_RENDERKM_COMMANDs translated
+  ULONG                   GdiBadCmds;
+  ULONG                   GdiSkips;      // EX_CMD_GDI not executed (surface not mapped)
+  ULONG                   GdiOps[8];     // executed, per DXGK_GDIOP_*
+  // GDI on the GPU (gdigpu.c)
+  PUCHAR                  GdiScratch;    // CPU view of GDIGPU_BASE (write-combined, contiguous)
+  PMDL                    GdiPolyMdl;    // polygon list + tiler heap pages
+  BOOLEAN                 GdiGpuOk;
+  BOOLEAN                 GdiGpuTried;
+  BOOLEAN                 GdiGpuMapped;
+  ULONG                   GdiGpuPasses;
+  ULONG                   GdiGpuFails;
+  ULONGLONG               GdiGpuPixels;  // pixels done on the GPU / on the CPU (fill + copy candidates)
+  ULONGLONG               GdiCpuPixels;
+  ULONG                   GdiGpuDraws;
+  ULONG                   FlipWaits;      // GPU flips that had to wait for the previous one to latch
+  ULONG                   PresentGpuBlts; // DxgkDdiPresent blts done as GPU copy passes
+  ULONGLONG               PresentGpuPixels;
+  LONGLONG                PresentGpuTicks;    // GDI commands done in batched passes (passes: GdiGpuPasses)
+  ULONGLONG               GdiSelfPixels;  // copies within one surface (scrolls): on the GPU (2 passes) / CPU
+  LONGLONG                GdiSelfTicks;
+  ULONGLONG               GdiSelfCpuPixels;
+  LONGLONG                GdiSelfCpuTicks;
+  PMDL                    GdiTempMdl;     // GDIGPU_TEMP_BASE pages
+  LONGLONG                GdiGpuTicks;   // KeQueryPerformanceCounter time inside GPU passes / CPU operations
+  LONGLONG                GdiCpuTicks;
+  ULONGLONG               GdiOpPixels[8];   // the other CPU operations (generic path), per DXGK_GDIOP_*
+  LONGLONG                GdiOpTicks[8];
   volatile LONG           PreemptPending;
   ULONG                   PreemptFence;
   ULONG                   Preemptions;
@@ -200,6 +238,20 @@ NTSTATUS RenderQueryAdapterInfo (ADAPTER *A, CONST DXGKARG_QUERYADAPTERINFO *Q);
 VOID     RenderFillCaps (ADAPTER *A, DXGK_DRIVERCAPS *Caps);
 VOID     RenderDpc (ADAPTER *A);
 VOID     RenderInitData (DRIVER_INITIALIZATION_DATA *Init);
+
+//
+// GDI hardware acceleration (DxgkDdiRenderKm): on unless the service key
+// has GdiAcceleration = 0 (read in DriverEntry, before RenderInitData).
+//
+extern BOOLEAN  gGdiAccel;
+extern BOOLEAN  gGdiGpu;                 // GdiGpu = 0: GDI operations stay on the CPU
+
+struct _GDIGPU_PASS;
+VOID     GdiGpuReserveVa (ADAPTER *A);
+VOID     GdiGpuStart (ADAPTER *A);
+VOID     GdiGpuRelease (ADAPTER *A);
+BOOLEAN  GdiGpuRun (ADAPTER *A, CONST struct _GDIGPU_PASS *P);
+VOID     FlushMdlPages (PMDL Mdl, ULONG First, ULONG Count);
 PUCHAR   ScanoutVa (ADAPTER *A);
 
 //

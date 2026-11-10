@@ -29,6 +29,8 @@
 **/
 
 #include "exynoswddm.h"
+#include "gdiops.h"
+#include "gdigpu_build.h"
 #include "../../uefi/Exynos5420Pkg/Include/ExynosGpuCarveout.h"
 
 #ifndef EXW_GPU_MODE
@@ -77,6 +79,21 @@ static ULONG
 SurfacePitch (ULONG Width)
 {
   return (Width * 4 + 63) & ~63u;
+}
+
+//
+// GDI surfaces: A8 (ClearType gamma tables, A8 staging) or 32 bpp.
+//
+static ULONG
+FormatBpp (UINT32 Format)
+{
+  return (Format == D3DDDIFMT_A8) ? 1 : 4;
+}
+
+static ULONG
+GdiPitch (ULONG Width, UINT32 Format)
+{
+  return (Width * FormatBpp (Format) + 63) & ~63u;
 }
 
 //
@@ -187,7 +204,49 @@ GpuConnect (ADAPTER *A)
     }
     GpuMap (A, Todo);
   }
+  GdiGpuStart (A);
   return TRUE;
+}
+
+
+//
+// ---------------------------------------------------------------------------
+// Cache hygiene for pages handed to the (non-coherent) GPU.  VidMm zeroes
+// fresh pages through a cached mapping; those dirty lines stay in the CPU
+// caches while the pages are then used through write-combined (Normal
+// non-cacheable) aliases and by the Mali.  A stale dirty line evicted later
+// overwrites newer data in RAM (random 32/64-byte chunks of vertex data or
+// pixels), and a stale clean line can be read instead of what the GPU wrote.
+// Clean + invalidate the pages by VA (DCCIMVAC) through a temporary cached
+// mapping before the GPU sees them.
+// ---------------------------------------------------------------------------
+//
+VOID
+FlushMdlPages (PMDL Mdl, ULONG First, ULONG Count)
+{
+  PMDL    Part;
+  PUCHAR  Start, Va, P;
+  SIZE_T  Bytes = (SIZE_T)Count << PAGE_SHIFT;
+
+  if ((Mdl == NULL) || (Count == 0)) {
+    return;
+  }
+  Start = (PUCHAR)MmGetMdlVirtualAddress (Mdl) + ((SIZE_T)First << PAGE_SHIFT);
+  Part  = IoAllocateMdl (Start, (ULONG)Bytes, FALSE, FALSE, NULL);
+  if (Part == NULL) {
+    return;
+  }
+  IoBuildPartialMdl (Mdl, Part, Start, (ULONG)Bytes);
+  Va = MmMapLockedPagesSpecifyCache (Part, KernelMode, MmCached, NULL, FALSE, NormalPagePriority | MdlMappingNoExecute);
+  if (Va != NULL) {
+    __builtin_arm_dsb (15);
+    for (P = Va; P < Va + Bytes; P += 32) {
+      __builtin_arm_mcr (15, 0, (unsigned)(ULONG_PTR)P, 7, 14, 1);   // DCCIMVAC
+    }
+    __builtin_arm_dsb (15);
+    MmUnmapLockedPages (Va, Part);
+  }
+  IoFreeMdl (Part);
 }
 
 static VOID
@@ -200,6 +259,7 @@ GpuMap (ADAPTER *A, EX_ALLOCATION *X)
     return;
   }
   Pages  = min (X->Pages, (ULONG)(MmGetMdlByteCount (X->Mdl) >> PAGE_SHIFT) - X->MdlPage);
+  FlushMdlPages (X->Mdl, X->MdlPage, Pages);
   Status = A->Gpu.MapPages (A->Gpu.Header.Context, X->GpuVa, MmGetMdlPfnArray (X->Mdl) + X->MdlPage, Pages);
   X->GpuMapped = NT_SUCCESS (Status);
   A->Maps++;
@@ -220,6 +280,7 @@ GpuMapRange (ADAPTER *A, EX_ALLOCATION *X, ULONG First, ULONG Count)
   if ((X->Mdl == NULL) || (X->GpuVa == 0) || (Count == 0) || !GpuConnect (A)) {
     return;
   }
+  FlushMdlPages (X->Mdl, First, Count);
   Status = A->Gpu.MapPages (A->Gpu.Header.Context, X->GpuVa + (ULONGLONG)First * PAGE_SIZE,
                             MmGetMdlPfnArray (X->Mdl) + First, Count);
   A->Maps++;
@@ -266,7 +327,13 @@ CpuVa (EX_ALLOCATION *X)
     return NULL;
   }
   IoBuildPartialMdl (X->Mdl, X->CpuMdl, Start, Bytes);
-  X->CpuVa = MmMapLockedPagesSpecifyCache (X->CpuMdl, KernelMode, MmWriteCombined, NULL, FALSE,
+  //
+  // Write-combined like VidMm's own lock mappings; GDI surfaces in existing
+  // system memory are mapped cached by their owner (win32k), and a second,
+  // non-cacheable alias of cached pages is undefined on ARM - map those
+  // cached too (same physically tagged cache, no aliasing problem).
+  //
+  X->CpuVa = MmMapLockedPagesSpecifyCache (X->CpuMdl, KernelMode, X->CpuCached ? MmCached : MmWriteCombined, NULL, FALSE,
                                            NormalPagePriority | MdlMappingNoExecute);
   if (X->CpuVa == NULL) {
     IoFreeMdl (X->CpuMdl);
@@ -317,7 +384,7 @@ AllocBySegAddress (ADAPTER *A, ULONGLONG Address)
 PUCHAR
 ScanoutVa (ADAPTER *A)
 {
-  if (A->ScanFront < 2) {
+  if (A->ScanFront < SCAN_BUFS) {
     return A->ScanBuf[A->ScanFront].Va;
   }
   return (A->ScanPa == A->Boot.Pa.LowPart) ? A->Boot.Va : A->Fb;
@@ -347,6 +414,24 @@ RenderFillCaps (ADAPTER *A, DXGK_DRIVERCAPS *Caps)
   Caps->PreemptionCaps.ComputePreemptionGranularity  = D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
   Caps->PresentationCaps.NoScreenToScreenBlt = 1;
   Caps->PresentationCaps.NoOverlapScreenBlt  = 1;
+  if (gGdiAccel) {
+    //
+    // GDI hardware acceleration (DxgkDdiRenderKm).  Every operation, every
+    // ROP3, mirrored and BLACKONWHITE / WHITEONBLACK stretches and same-
+    // surface (overlapping) blts are supported (gdiops.c).  The aperture is
+    // not cache coherent (the Mali does not snoop): say so, CDD then keeps
+    // its CPU-side surfaces out of the aperture-coherency assumptions.
+    //
+    Caps->PresentationCaps.SupportKernelModeCommandBuffer = 1;
+    Caps->PresentationCaps.AlignmentShift                 = 6;     // pitches: 64 bytes (GdiPitch)
+    Caps->PresentationCaps.MaxTextureWidthShift           = 2;     // 2^(11 + 2) = 8192 (Mali-T628 limit)
+    Caps->PresentationCaps.MaxTextureHeightShift          = 2;
+    Caps->PresentationCaps.SupportAllBltRops              = 1;
+    Caps->PresentationCaps.SupportMirrorStretchBlt        = 1;
+    Caps->PresentationCaps.SupportMonoStretchBltModes     = 1;
+    Caps->PresentationCaps.NoTempSurfaceForClearTypeBlend = 1;
+    Caps->PresentationCaps.NoCacheCoherentApertureMemory  = 1;
+  }
 }
 
 static VOID
@@ -440,7 +525,7 @@ BltToFront (ADAPTER *A, CONST UCHAR *Src, ULONG SrcPitch, CONST EX_RECT *R)
   LONG    Left = max (R->Left, 0);
   LONG    Right = min (R->Right, (LONG)WIDTH);
 
-  if ((A->ScanAllocBuf >= 2) || (Right <= Left)) {
+  if ((A->ScanAllocBuf >= SCAN_BUFS) || (Right <= Left)) {
     return;
   }
   Front = A->ScanBuf[A->ScanAllocBuf].Va;     // the buffer this primary was flipped to (latched or not yet)
@@ -450,14 +535,22 @@ BltToFront (ADAPTER *A, CONST UCHAR *Src, ULONG SrcPitch, CONST EX_RECT *R)
   }
 }
 
+static BOOLEAN GdiGpuPresentBlt (ADAPTER *A, CONST EX_CMD_BLT_ARGS *B);
+
 static VOID
 ExecBlt (ADAPTER *A, CONST EX_CMD_BLT_ARGS *B, BOOLEAN Fill)
 {
   EX_ALLOCATION  *DstX = (EX_ALLOCATION *)(ULONG_PTR)B->Dst.Address;
   EX_ALLOCATION  *SrcX = Fill ? NULL : (EX_ALLOCATION *)(ULONG_PTR)B->Src.Address;
-  PUCHAR         Dst = (DstX != NULL) ? CpuVa (DstX) : NULL;
-  PUCHAR         Src = (SrcX != NULL) ? CpuVa (SrcX) : NULL;
+  PUCHAR         Dst;
+  PUCHAR         Src;
   ULONG          Index;
+
+  if (!Fill && GdiGpuPresentBlt (A, B)) {
+    return;                                       // windowed D3D present (back buffer -> DWM's surface) on the GPU
+  }
+  Dst = (DstX != NULL) ? CpuVa (DstX) : NULL;
+  Src = (SrcX != NULL) ? CpuVa (SrcX) : NULL;
 
   if ((Dst == NULL) || (!Fill && (Src == NULL))) {
     if (A->BadCommands++ < 10) {
@@ -499,6 +592,626 @@ ExecBlt (ADAPTER *A, CONST EX_CMD_BLT_ARGS *B, BOOLEAN Fill)
     }
     if ((DstX == A->ScanAlloc) && !DstX->GpuPresented) {
       BltToFront (A, Dst, B->DstPitch, &R);
+    }
+  }
+}
+
+
+//
+// ---------------------------------------------------------------------------
+// GDI hardware acceleration, executed on the CPU (gdiops.c)
+// ---------------------------------------------------------------------------
+//
+
+/**
+  The CPU view of a GDI operand, for gdiops.  Pitch: the command's for the
+  CPU-visible types (the WDK: "must be used" for STAGING_CPUVISIBLE and
+  EXISTINGSYSMEM), the allocation's otherwise.  CpuLock held.
+**/
+static BOOLEAN
+GdiSurf (EX_ALLOCATION *X, UINT32 CmdPitch, GDI_SURF *S)
+{
+  PUCHAR  Va;
+
+  RtlZeroMemory (S, sizeof (*S));
+  if ((X == NULL) || (X->Mdl == NULL)) {
+    return FALSE;
+  }
+  Va = CpuVa (X);
+  if (Va == NULL) {
+    return FALSE;
+  }
+  S->Base   = Va;
+  S->Width  = X->Info.Width;
+  S->Height = X->Info.Height;
+  S->Bpp    = (X->Bpp != 0) ? X->Bpp : 4;
+  S->Pitch  = X->Info.Pitch;
+  if (((X->GdiType == D3DKMDT_GDISURFACE_STAGING_CPUVISIBLE) || (X->GdiType == D3DKMDT_GDISURFACE_EXISTINGSYSMEM)) &&
+      (CmdPitch != 0)) {
+    S->Pitch = CmdPitch;
+  }
+  if (S->Pitch == 0) {
+    S->Pitch = GdiPitch (S->Width, X->Info.Format);
+  }
+  S->Bytes  = X->Pages << PAGE_SHIFT;
+  return GdiSurfValidate (S) != 0;
+}
+
+//
+// GPU work this big (pixels, all rectangles of a pass together) or more goes
+// to the GPU; less costs less on the CPU than a GPU round trip.
+//
+#define GDI_GPU_MIN_PIXELS   (64 * 64)
+
+static BOOLEAN
+GdiGpuOperand (EX_ALLOCATION *X, CONST GDI_SURF *S)
+{
+  return (X != NULL) && X->GpuMapped && (X->GpuVa != 0) && !X->CpuCached && (S->Bpp == 4) &&
+         ((X->Info.Format == D3DDDIFMT_A8R8G8B8) || (X->Info.Format == D3DDDIFMT_X8R8G8B8)) && ((S->Pitch & 63) == 0);
+}
+
+//
+// One GDI command as a GPU draw: the rectangles clipped exactly as gdiops
+// does (destination, and for textured ops the source that exists), in
+// destination coordinates.
+//
+typedef struct {
+  unsigned       Op;                      // GDIGPU_OP_*
+  BOOLEAN        Self;                    // copy within the destination (needs the temp, never batched)
+  EX_ALLOCATION  *SrcX;
+  ULONGLONG      GammaVa;                 // cleartype: the gamma row
+  INT32          Dx, Dy;                  // source = destination + (Dx, Dy)
+  ULONG          N;
+  GDIGPU_RECT    R[EX_GDI_MAX_RECTS];
+  LONG           L, T, Rr, B;             // bounding box
+  ULONGLONG      Area;
+} GDI_PREP;
+
+static BOOLEAN
+GdiGpuPrepare (ADAPTER *A, CONST EX_CMD_GDI_ARGS *G, CONST GDI_SURF *Dst, CONST GDI_SURF *Src, ULONG Count, GDI_PREP *Pp)
+{
+  EX_ALLOCATION  *DstX = (EX_ALLOCATION *)(ULONG_PTR)G->Dst;
+  EX_ALLOCATION  *SrcX = (EX_ALLOCATION *)(ULONG_PTR)G->Src;
+  BOOLEAN        Copy;
+  ULONG          I;
+
+  if (!A->GdiGpuOk || (Count == 0) || (Count > EX_GDI_MAX_RECTS) || (Count > GDIGPU_MAX_RECTS)) {
+    return FALSE;
+  }
+  Pp->Dx = 0;
+  Pp->Dy = 0;
+  Pp->SrcX = NULL;
+  Pp->Self = FALSE;
+  Pp->GammaVa = 0;
+  if ((G->GdiOp == EX_GDI_COLORFILL) && (G->Rop == GDI_FILL_PATCOPY)) {
+    Copy   = FALSE;
+    Pp->Op = GDIGPU_OP_FILL;
+  } else if ((((G->GdiOp == EX_GDI_BITBLT) && (G->Rop == GDI_BLT_SRCCOPY)) ||
+              ((G->GdiOp == EX_GDI_ALPHABLEND) &&
+               ((G->SrcRect.Right - G->SrcRect.Left) == (G->DstRect.Right - G->DstRect.Left)) &&     // unstretched only:
+               ((G->SrcRect.Bottom - G->SrcRect.Top) == (G->DstRect.Bottom - G->DstRect.Top)) &&     // texel centres exact
+               ((G->Flags & EX_GDI_F_HASALPHA) || ((G->ConstantAlpha & 0xFF) != 0)))) &&
+             (SrcX != NULL) && ((SrcX != DstX) || ((G->GdiOp == EX_GDI_BITBLT) && (A->GdiTempMdl != NULL)))) {
+    Copy     = TRUE;                      // textured: source rectangles clipped like a copy
+    Pp->Op   = (G->GdiOp == EX_GDI_BITBLT) ? GDIGPU_OP_COPY :
+               (G->Flags & EX_GDI_F_HASALPHA) ? GDIGPU_OP_ALPHAP : GDIGPU_OP_ALPHAC;
+    Pp->Self = (SrcX == DstX);
+    Pp->SrcX = SrcX;
+    Pp->Dx   = G->SrcRect.Left - G->DstRect.Left;
+    Pp->Dy   = G->SrcRect.Top - G->DstRect.Top;
+    if (!GdiGpuOperand (SrcX, Src) || (Src->Width > GDIGPU_MAX_DIM) || (Src->Height > GDIGPU_MAX_DIM) ||
+        (Pp->Dx > GDIGPU_MAX_DIM) || (Pp->Dx < -GDIGPU_MAX_DIM) || (Pp->Dy > GDIGPU_MAX_DIM) || (Pp->Dy < -GDIGPU_MAX_DIM)) {
+      return FALSE;
+    }
+  } else if ((G->GdiOp == EX_GDI_CLEARTYPEBLEND) && (G->GammaIndex != GDI_GAMMA_INVALID) && (G->Gamma != 0) &&
+             (G->Alpha != 0) && (G->Src == 0) && (G->Alpha != G->Dst)) {
+    //
+    // ClearType with a gamma table (the antialiased / table-less variants
+    // stay on the CPU).  The coverage surface is the source.
+    //
+    EX_ALLOCATION  *GamX = (EX_ALLOCATION *)(ULONG_PTR)G->Gamma;
+    GDI_SURF       Gam;
+
+    SrcX = (EX_ALLOCATION *)(ULONG_PTR)G->Alpha;
+    if (!GdiSurf (GamX, 0, &Gam) || !GamX->GpuMapped || (GamX->GpuVa == 0) || GamX->CpuCached || (Gam.Bpp != 1) ||
+        (Gam.Width < GDI_GAMMA_WIDTH) || (G->GammaIndex >= Gam.Height) || ((Gam.Pitch & 63) != 0)) {
+      return FALSE;
+    }
+    Copy        = TRUE;                   // coverage rectangles clipped like a copy's source
+    Pp->Op      = GDIGPU_OP_CT;
+    Pp->SrcX    = SrcX;
+    Pp->Dx      = G->OffsetX;
+    Pp->Dy      = G->OffsetY;
+    Pp->GammaVa = GamX->GpuVa + (ULONGLONG)G->GammaIndex * Gam.Pitch;
+    if (!GdiGpuOperand (SrcX, Src) || (Src->Width > GDIGPU_MAX_DIM) || (Src->Height > GDIGPU_MAX_DIM) ||
+        (Pp->Dx > GDIGPU_MAX_DIM) || (Pp->Dx < -GDIGPU_MAX_DIM) || (Pp->Dy > GDIGPU_MAX_DIM) || (Pp->Dy < -GDIGPU_MAX_DIM)) {
+      return FALSE;
+    }
+  } else {
+    return FALSE;
+  }
+  if (!GdiGpuOperand (DstX, Dst) || (Dst->Width > GDIGPU_MAX_DIM) || (Dst->Height > GDIGPU_MAX_DIM)) {
+    return FALSE;
+  }
+  Pp->N = 0;
+  Pp->Area = 0;
+  Pp->L = MAXLONG;
+  Pp->T = MAXLONG;
+  Pp->Rr = MINLONG;
+  Pp->B = MINLONG;
+  for (I = 0; I < Count; I++) {
+    GDIGPU_RECT  R;
+
+    R.Left   = max (G->Rects[I].Left, 0);
+    R.Top    = max (G->Rects[I].Top, 0);
+    R.Right  = min (G->Rects[I].Right, (LONG)Dst->Width);
+    R.Bottom = min (G->Rects[I].Bottom, (LONG)Dst->Height);
+    if (Copy) {
+      R.Left   = max (R.Left, -Pp->Dx);
+      R.Top    = max (R.Top, -Pp->Dy);
+      R.Right  = min (R.Right, (LONG)Src->Width - Pp->Dx);
+      R.Bottom = min (R.Bottom, (LONG)Src->Height - Pp->Dy);
+    }
+    if ((R.Right <= R.Left) || (R.Bottom <= R.Top)) {
+      continue;
+    }
+    Pp->R[Pp->N++] = R;
+    Pp->Area += (ULONGLONG)(R.Right - R.Left) * (ULONGLONG)(R.Bottom - R.Top);
+    Pp->L  = min (Pp->L, R.Left);
+    Pp->T  = min (Pp->T, R.Top);
+    Pp->Rr = max (Pp->Rr, R.Right);
+    Pp->B  = max (Pp->B, R.Bottom);
+  }
+  return Pp->N != 0;
+}
+
+static ULONGLONG
+BoxArea (LONG L, LONG T, LONG R, LONG B)
+{
+  return (ULONGLONG)(R - L) * (ULONGLONG)(B - T);
+}
+
+//
+// The pending batch: consecutive GPU draws on one destination (worker
+// thread only, CpuLock held), executed in GDI's order as one pass.  Flushed
+// before anything else touches surfaces: another destination, a CPU op, a
+// copy within the destination, a non-GDI command, the end of the buffer.
+//
+typedef struct {
+  CONST EX_CMD_GDI_ARGS  *G;
+  GDI_SURF               Src;
+  GDI_PREP               Prep;
+} GDI_BATCH_ENTRY;
+
+static struct {
+  EX_ALLOCATION    *DstX;
+  GDI_SURF         Dst;
+  ULONG            N;
+  ULONG            Rects;                   // rectangles used, each draw from an even index
+  LONG             L, T, Rr, B;
+  ULONGLONG        Area;
+  ULONGLONG        Boxes;                   // the draws' own bounding boxes, summed
+  GDI_BATCH_ENTRY  E[GDIGPU_MAX_DRAWS];
+} gBatch;
+
+static GDIGPU_PASS  gPass;                  // worker thread only (kept off the kernel stack)
+
+static BOOLEAN
+Self (CONST GDI_BATCH_ENTRY *E, ULONG N)
+{
+  return (N == 1) && E[0].Prep.Self;
+}
+
+static VOID GdiExecCpu (ADAPTER *A, CONST EX_CMD_GDI_ARGS *G, CONST GDI_SURF *Dst, CONST GDI_SURF *Src);
+
+/**
+  Runs N prepared draws on destination DstX as one pass (FbVa = the box,
+  or the temp for pass 1 of a copy within a surface).  TRUE if done.
+**/
+static BOOLEAN
+GdiRunDraws (ADAPTER *A, EX_ALLOCATION *DstX, CONST GDI_SURF *Dst, GDI_BATCH_ENTRY *E, ULONG N, LONG L, LONG T, LONG Rr,
+             LONG B)
+{
+  GDIGPU_PASS  *P = &gPass;
+  ULONG        D;
+  ULONG        I;
+  ULONG        First = 0;
+
+  L &= ~15;                               // colour writeback base 64-byte aligned
+  P->FbVa      = DstX->GpuVa + (ULONGLONG)T * Dst->Pitch + (ULONGLONG)L * 4;
+  P->FbPitch   = Dst->Pitch;
+  P->FbW       = (unsigned)(Rr - L);
+  P->FbH       = (unsigned)(B - T);
+  P->DrawCount = N;
+  for (D = 0; D < N; D++) {
+    GDI_PREP     *Pp = &E[D].Prep;
+    GDIGPU_DRAW  *Dr = &P->Draws[D];
+
+    Dr->Op            = Pp->Op;
+    Dr->ConstantAlpha = E[D].G->ConstantAlpha & 0xFF;
+    Dr->Color         = E[D].G->Color;
+    Dr->Color2        = E[D].G->Color2;
+    Dr->GammaVa       = Pp->GammaVa;
+    Dr->FirstRect     = First;
+    Dr->RectCount     = Pp->N;
+    for (I = 0; I < Pp->N; I++) {
+      GDIGPU_RECT  *R = &P->Rects[First + I];
+
+      R->Left   = Pp->R[I].Left - L;
+      R->Right  = Pp->R[I].Right - L;
+      R->Top    = Pp->R[I].Top - T;
+      R->Bottom = Pp->R[I].Bottom - T;
+    }
+    if (Pp->SrcX != NULL) {
+      Dr->SrcVa    = Pp->SrcX->GpuVa;
+      Dr->SrcPitch = E[D].Src.Pitch;
+      Dr->SrcW     = E[D].Src.Width;
+      Dr->SrcH     = E[D].Src.Height;
+      Dr->SrcDx    = L + Pp->Dx;          // source = framebuffer + (L, T) + (Dx, Dy)
+      Dr->SrcDy    = T + Pp->Dy;
+    }
+    First += (Pp->N + 1) & ~1u;
+  }
+  if (Self (E, N)) {
+    //
+    // A copy within one surface (a scroll: source and destination overlap).
+    // One pass would read tiles that other tiles are writing back, so: pass
+    // 1 copies the rectangles' source into the temp (laid out like the
+    // framebuffer box), pass 2 copies them from the temp to the destination.
+    // Pass 1 only reads the surface; if pass 2 fails before writing, the CPU
+    // redoes the whole copy from the untouched surface.
+    //
+    ULONG     TempPitch = ((P->FbW * 4) + 63) & ~63u;
+    ULONGLONG Dst0 = P->FbVa;
+    BOOLEAN   Done;
+
+    if ((ULONGLONG)TempPitch * P->FbH > GDIGPU_TEMP_SIZE) {
+      return FALSE;
+    }
+    P->FbVa    = GDIGPU_TEMP_BASE;
+    P->FbPitch = TempPitch;
+    Done = GdiGpuRun (A, P);
+    if (Done) {
+      P->FbVa              = Dst0;
+      P->FbPitch           = Dst->Pitch;
+      P->Draws[0].SrcVa    = GDIGPU_TEMP_BASE;
+      P->Draws[0].SrcPitch = TempPitch;
+      P->Draws[0].SrcW     = P->FbW;
+      P->Draws[0].SrcH     = P->FbH;
+      P->Draws[0].SrcDx    = 0;
+      P->Draws[0].SrcDy    = 0;
+      Done = GdiGpuRun (A, P);
+    }
+    return Done;
+  }
+  return GdiGpuRun (A, P);
+}
+
+static VOID
+GdiBatchFlush (ADAPTER *A)
+{
+  ULONG          D;
+  LARGE_INTEGER  T0;
+
+  if (gBatch.N == 0) {
+    return;
+  }
+  T0 = KeQueryPerformanceCounter (NULL);
+  if ((gBatch.Area >= GDI_GPU_MIN_PIXELS) &&
+      GdiRunDraws (A, gBatch.DstX, &gBatch.Dst, gBatch.E, gBatch.N, gBatch.L, gBatch.T, gBatch.Rr, gBatch.B)) {
+    A->GdiGpuTicks  += KeQueryPerformanceCounter (NULL).QuadPart - T0.QuadPart;
+    A->GdiGpuPixels += gBatch.Area;
+    A->GdiGpuDraws  += gBatch.N;
+    for (D = 0; D < gBatch.N; D++) {
+      A->GdiOps[gBatch.E[D].G->GdiOp]++;
+    }
+  } else {
+    for (D = 0; D < gBatch.N; D++) {      // too small for a GPU round trip, or the pass failed: in order on the CPU
+      GdiExecCpu (A, gBatch.E[D].G, &gBatch.Dst, &gBatch.E[D].Src);
+    }
+  }
+  gBatch.N = 0;
+}
+
+/**
+  A present blt (DxgkDdiPresent: a windowed swap chain's back buffer into
+  DWM's redirection surface) as one GPU copy pass: the CPU path reads the
+  whole frame out of write-combined memory.  TRUE if done.  Worker thread,
+  the GDI batch already flushed (Execute flushes before non-GDI commands).
+**/
+static BOOLEAN
+GdiGpuPresentBlt (ADAPTER *A, CONST EX_CMD_BLT_ARGS *B)
+{
+  static EX_CMD_GDI_ARGS  NoArgs;           // copy: no colour / alpha
+  static GDI_BATCH_ENTRY  E;
+  EX_ALLOCATION           *DstX = (EX_ALLOCATION *)(ULONG_PTR)B->Dst.Address;
+  EX_ALLOCATION           *SrcX = (EX_ALLOCATION *)(ULONG_PTR)B->Src.Address;
+  GDI_SURF                Dst;
+  ULONG                   I;
+  LARGE_INTEGER           T0;
+  BOOLEAN                 Done;
+
+  {
+    ULONG  Why = !A->GdiGpuOk ? 1 : (DstX == NULL) ? 2 : (SrcX == NULL) ? 3 : (DstX == SrcX) ? 4 : (DstX == A->ScanAlloc) ? 5 :
+                 ((B->RectCount == 0) || (B->RectCount > GDIGPU_MAX_RECTS)) ? 6 :
+                 ((B->DstWidth > GDIGPU_MAX_DIM) || (B->DstHeight > GDIGPU_MAX_DIM) || (B->SrcWidth > GDIGPU_MAX_DIM) ||
+                  (B->SrcHeight > GDIGPU_MAX_DIM)) ? 7 :
+                 ((B->OffsetX > GDIGPU_MAX_DIM) || (B->OffsetX < -GDIGPU_MAX_DIM) || (B->OffsetY > GDIGPU_MAX_DIM) ||
+                  (B->OffsetY < -GDIGPU_MAX_DIM)) ? 8 : 0;
+    static ULONG  Logged0;
+
+    if (Why != 0) {
+      if (Logged0++ < 6) {
+        OsLog ("exynoswddm: present blt stays on the CPU: reason %lu, %lu rects, dst %lux%lu src %lux%lu offset %ld,%ld", Why,
+               B->RectCount, B->DstWidth, B->DstHeight, B->SrcWidth, B->SrcHeight, B->OffsetX, B->OffsetY);
+      }
+      return FALSE;
+    }
+  }
+  RtlZeroMemory (&Dst, sizeof (Dst));
+  Dst.Width  = B->DstWidth;
+  Dst.Height = B->DstHeight;
+  Dst.Pitch  = B->DstPitch;
+  Dst.Bpp    = 4;
+  RtlZeroMemory (&E.Src, sizeof (E.Src));
+  E.Src.Width  = B->SrcWidth;
+  E.Src.Height = B->SrcHeight;
+  E.Src.Pitch  = B->SrcPitch;
+  E.Src.Bpp    = 4;
+  if (!GdiGpuOperand (DstX, &Dst) || !GdiGpuOperand (SrcX, &E.Src) ||
+      ((ULONGLONG)B->DstPitch * B->DstHeight > ((ULONGLONG)DstX->Pages << PAGE_SHIFT)) ||
+      ((ULONGLONG)B->SrcPitch * B->SrcHeight > ((ULONGLONG)SrcX->Pages << PAGE_SHIFT))) {
+    static ULONG  Logged;
+
+    if (Logged++ < 6) {
+      OsLog ("exynoswddm: present blt stays on the CPU: dst %lux%lu pitch %lu fmt %lu mapped %u va 0x%08lx cached %u pages %lu; "
+             "src %lux%lu pitch %lu fmt %lu mapped %u va 0x%08lx cached %u pages %lu", B->DstWidth, B->DstHeight, B->DstPitch,
+             (ULONG)DstX->Info.Format, DstX->GpuMapped, (ULONG)DstX->GpuVa, DstX->CpuCached, DstX->Pages, B->SrcWidth,
+             B->SrcHeight, B->SrcPitch, (ULONG)SrcX->Info.Format, SrcX->GpuMapped, (ULONG)SrcX->GpuVa, SrcX->CpuCached,
+             SrcX->Pages);
+    }
+    return FALSE;
+  }
+  //
+  // The rectangles clipped exactly as ExecBlt's CPU loop does.
+  //
+  E.G         = &NoArgs;
+  E.Prep.Op   = GDIGPU_OP_COPY;
+  E.Prep.Self = FALSE;
+  E.Prep.SrcX = SrcX;
+  E.Prep.Dx   = B->OffsetX;
+  E.Prep.Dy   = B->OffsetY;
+  E.Prep.GammaVa = 0;
+  E.Prep.N    = 0;
+  E.Prep.Area = 0;
+  E.Prep.L = MAXLONG;
+  E.Prep.T = MAXLONG;
+  E.Prep.Rr = MINLONG;
+  E.Prep.B = MINLONG;
+  for (I = 0; I < B->RectCount; I++) {
+    GDIGPU_RECT  R;
+
+    R.Left   = max (max (B->Rects[I].Left, 0), -B->OffsetX);
+    R.Top    = max (max (B->Rects[I].Top, 0), -B->OffsetY);
+    R.Right  = min (min (B->Rects[I].Right, (LONG)B->DstWidth), (LONG)B->SrcWidth - B->OffsetX);
+    R.Bottom = min (min (B->Rects[I].Bottom, (LONG)B->DstHeight), (LONG)B->SrcHeight - B->OffsetY);
+    if ((R.Right <= R.Left) || (R.Bottom <= R.Top)) {
+      continue;
+    }
+    E.Prep.R[E.Prep.N++] = R;
+    E.Prep.Area += (ULONGLONG)(R.Right - R.Left) * (ULONGLONG)(R.Bottom - R.Top);
+    E.Prep.L  = min (E.Prep.L, R.Left);
+    E.Prep.T  = min (E.Prep.T, R.Top);
+    E.Prep.Rr = max (E.Prep.Rr, R.Right);
+    E.Prep.B  = max (E.Prep.B, R.Bottom);
+  }
+  if ((E.Prep.N == 0) || (E.Prep.Area < GDI_GPU_MIN_PIXELS)) {
+    static ULONG  Logged1;
+
+    if (Logged1++ < 6) {
+      OsLog ("exynoswddm: present blt stays on the CPU: %lu rects left, %lu pixels; first rect %ld,%ld-%ld,%ld offset %ld,%ld",
+             E.Prep.N, (ULONG)E.Prep.Area, B->Rects[0].Left, B->Rects[0].Top, B->Rects[0].Right, B->Rects[0].Bottom,
+             B->OffsetX, B->OffsetY);
+    }
+    return FALSE;
+  }
+  T0 = KeQueryPerformanceCounter (NULL);
+  Done = GdiRunDraws (A, DstX, &Dst, &E, 1, E.Prep.L, E.Prep.T, E.Prep.Rr, E.Prep.B);
+  if (!Done) {
+    static ULONG  Logged2;
+
+    if (Logged2++ < 6) {
+      OsLog ("exynoswddm: present blt: GPU pass refused / failed (box %ld,%ld-%ld,%ld)", E.Prep.L, E.Prep.T, E.Prep.Rr, E.Prep.B);
+    }
+  }
+  if (Done) {
+    A->PresentGpuBlts++;
+    A->PresentGpuPixels += E.Prep.Area;
+    A->PresentGpuTicks  += KeQueryPerformanceCounter (NULL).QuadPart - T0.QuadPart;
+  }
+  return Done;
+}
+
+static VOID
+ExecGdi (ADAPTER *A, CONST EX_CMD_GDI_ARGS *G)
+{
+  GDI_SURF         Dst;
+  GDI_SURF         Src;
+  BOOLEAN          HaveSrc = FALSE;
+  ULONG            Count = min (G->RectCount, (ULONG)EX_GDI_MAX_RECTS);
+  EX_ALLOCATION    *DstX = (EX_ALLOCATION *)(ULONG_PTR)G->Dst;
+  GDI_BATCH_ENTRY  *E;
+
+  if ((G->Hdr.Size < FIELD_OFFSET (EX_CMD_GDI_ARGS, Rects) + Count * sizeof (EX_RECT)) ||
+      !GdiSurf (DstX, G->DstPitch, &Dst)) {
+    if (A->GdiSkips++ < 20) {
+      OsLog ("exynoswddm: GDI op %lu skipped: destination %p not mapped / invalid", G->GdiOp, (PVOID)(ULONG_PTR)G->Dst);
+    }
+    return;
+  }
+  RtlZeroMemory (&Src, sizeof (Src));
+  if (G->Src != 0) {
+    HaveSrc = GdiSurf ((EX_ALLOCATION *)(ULONG_PTR)G->Src, G->SrcPitch, &Src);
+  } else if (G->Alpha != 0) {
+    HaveSrc = GdiSurf ((EX_ALLOCATION *)(ULONG_PTR)G->Alpha, G->SrcPitch, &Src);
+  }
+  if ((G->GdiOp != EX_GDI_COLORFILL) && !HaveSrc) {
+    if (A->GdiSkips++ < 20) {
+      OsLog ("exynoswddm: GDI op %lu skipped: source %p not mapped / invalid", G->GdiOp,
+             (PVOID)(ULONG_PTR)(G->Src ? G->Src : G->Alpha));
+    }
+    return;
+  }
+  //
+  // The next free entry is the scratch for preparing this command.
+  //
+  if (gBatch.N == GDIGPU_MAX_DRAWS) {
+    GdiBatchFlush (A);
+  }
+  E = &gBatch.E[gBatch.N];
+  if (!GdiGpuPrepare (A, G, &Dst, &Src, Count, &E->Prep)) {
+    GdiBatchFlush (A);
+    GdiExecCpu (A, G, &Dst, &Src);
+    return;
+  }
+  E->G   = G;
+  E->Src = Src;
+  if (E->Prep.Self) {
+    GDI_BATCH_ENTRY  One;
+    LARGE_INTEGER    T0;
+
+    One = *E;                             // the flush reuses the entries
+    GdiBatchFlush (A);
+    T0 = KeQueryPerformanceCounter (NULL);
+    if ((One.Prep.Area >= GDI_GPU_MIN_PIXELS) &&
+        GdiRunDraws (A, DstX, &Dst, &One, 1, One.Prep.L, One.Prep.T, One.Prep.Rr, One.Prep.B)) {
+      A->GdiSelfTicks  += KeQueryPerformanceCounter (NULL).QuadPart - T0.QuadPart;
+      A->GdiSelfPixels += One.Prep.Area;
+      A->GdiOps[G->GdiOp]++;
+    } else {
+      GdiExecCpu (A, G, &Dst, &Src);
+    }
+    return;
+  }
+  //
+  // Join the batch if it is on this destination, the rectangles fit and the
+  // common box does not grow the preload much beyond the draws' own boxes.
+  //
+  if ((gBatch.N != 0) && (E->Prep.Op == GDIGPU_OP_CT)) {
+    GDI_BATCH_ENTRY  One = *E;            // cleartype reads the destination from memory: it starts a pass
+
+    GdiBatchFlush (A);
+    gBatch.E[0] = One;
+    E = &gBatch.E[0];
+  }
+  if (gBatch.N != 0) {
+    LONG  L  = min (gBatch.L, E->Prep.L);
+    LONG  T  = min (gBatch.T, E->Prep.T);
+    LONG  Rr = max (gBatch.Rr, E->Prep.Rr);
+    LONG  B  = max (gBatch.B, E->Prep.B);
+
+    if ((gBatch.DstX != DstX) || (gBatch.Rects + E->Prep.N > GDIGPU_MAX_RECTS) ||
+        (BoxArea (L, T, Rr, B) > gBatch.Boxes + BoxArea (E->Prep.L, E->Prep.T, E->Prep.Rr, E->Prep.B) + 128 * 128)) {
+      GDI_BATCH_ENTRY  One = *E;
+
+      GdiBatchFlush (A);
+      gBatch.E[0] = One;
+      E = &gBatch.E[0];
+    }
+  }
+  if (gBatch.N == 0) {
+    gBatch.DstX  = DstX;
+    gBatch.Dst   = Dst;
+    gBatch.Rects = 0;
+    gBatch.Area  = 0;
+    gBatch.Boxes = 0;
+    gBatch.L     = E->Prep.L;
+    gBatch.T     = E->Prep.T;
+    gBatch.Rr    = E->Prep.Rr;
+    gBatch.B     = E->Prep.B;
+  }
+  gBatch.L      = min (gBatch.L, E->Prep.L);
+  gBatch.T      = min (gBatch.T, E->Prep.T);
+  gBatch.Rr     = max (gBatch.Rr, E->Prep.Rr);
+  gBatch.B      = max (gBatch.B, E->Prep.B);
+  gBatch.Area  += E->Prep.Area;
+  gBatch.Boxes += BoxArea (E->Prep.L, E->Prep.T, E->Prep.Rr, E->Prep.B);
+  gBatch.Rects += (E->Prep.N + 1) & ~1u;
+  gBatch.N++;
+}
+
+/**
+  One GDI command on the CPU (gdiops.c).
+**/
+static VOID
+GdiExecCpu (ADAPTER *A, CONST EX_CMD_GDI_ARGS *G, CONST GDI_SURF *Dst, CONST GDI_SURF *Src)
+{
+  LARGE_INTEGER  T0 = KeQueryPerformanceCounter (NULL);
+  GDI_SURF       Gam;
+  BOOLEAN        HaveGam = FALSE;
+  ULONG          Index;
+  ULONG          Count = min (G->RectCount, (ULONG)EX_GDI_MAX_RECTS);
+  BOOLEAN        FillCopy = ((G->GdiOp == EX_GDI_COLORFILL) && (G->Rop == GDI_FILL_PATCOPY)) ||
+                            ((G->GdiOp == EX_GDI_BITBLT) && (G->Rop == GDI_BLT_SRCCOPY));
+  BOOLEAN        SelfCopy = (G->GdiOp == EX_GDI_BITBLT) && (G->Src == G->Dst);
+
+  if (G->Gamma != 0) {
+    HaveGam = GdiSurf ((EX_ALLOCATION *)(ULONG_PTR)G->Gamma, 0, &Gam);
+  }
+  for (Index = 0; Index < Count; Index++) {
+    CONST GDI_RECT  *R = (CONST GDI_RECT *)&G->Rects[Index];
+
+    if ((R->Right > R->Left) && (R->Bottom > R->Top)) {
+      ULONGLONG  Px = (ULONGLONG)(ULONG)(R->Right - R->Left) * (ULONG)(R->Bottom - R->Top);
+
+      if (FillCopy) {
+        A->GdiCpuPixels += Px;
+        if (SelfCopy) {
+          A->GdiSelfCpuPixels += Px;
+        }
+      } else if (G->GdiOp < 8) {
+        A->GdiOpPixels[G->GdiOp] += Px;
+      }
+    }
+    switch (G->GdiOp) {
+      case EX_GDI_COLORFILL:
+        GdiColorFill (Dst, R, G->Color, G->Rop, G->Rop3);
+        break;
+      case EX_GDI_BITBLT:
+        GdiBitBlt (Dst, Src, R, G->SrcRect.Left - G->DstRect.Left, G->SrcRect.Top - G->DstRect.Top, G->Rop, G->Rop3);
+        break;
+      case EX_GDI_STRETCHBLT:
+        GdiStretchBlt (Dst, Src, R, (CONST GDI_RECT *)&G->SrcRect, (CONST GDI_RECT *)&G->DstRect, G->Rop,
+                       (G->Flags & EX_GDI_F_MIRRORX) != 0, (G->Flags & EX_GDI_F_MIRRORY) != 0);
+        break;
+      case EX_GDI_ALPHABLEND:
+        GdiAlphaBlend (Dst, Src, R, (CONST GDI_RECT *)&G->SrcRect, (CONST GDI_RECT *)&G->DstRect, G->ConstantAlpha,
+                       (G->Flags & EX_GDI_F_HASALPHA) != 0);
+        break;
+      case EX_GDI_TRANSPARENTBLT:
+        GdiTransparentBlt (Dst, Src, R, (CONST GDI_RECT *)&G->SrcRect, (CONST GDI_RECT *)&G->DstRect, G->Color,
+                           (G->Flags & EX_GDI_F_HONORALPHA) != 0);
+        break;
+      case EX_GDI_CLEARTYPEBLEND:
+        GdiClearTypeBlend (Dst, Src, HaveGam ? &Gam : NULL, R, G->OffsetX, G->OffsetY, G->Color, G->Color2,
+                           G->GammaIndex);
+        break;
+      default:
+        A->BadCommands++;
+        return;
+    }
+  }
+  if ((G->GdiOp >= 1) && (G->GdiOp < 8)) {
+    LONGLONG  Dt = KeQueryPerformanceCounter (NULL).QuadPart - T0.QuadPart;
+
+    A->GdiOps[G->GdiOp]++;
+    if (FillCopy) {
+      A->GdiCpuTicks += Dt;
+      if (SelfCopy) {
+        A->GdiSelfCpuTicks += Dt;
+      }
+    } else {
+      A->GdiOpTicks[G->GdiOp] += Dt;
     }
   }
 }
@@ -636,6 +1349,61 @@ DumpFragments (ADAPTER *A, ULONGLONG Chain)
   ExReleaseFastMutex (&A->CpuLock);
 }
 
+
+#ifdef EXW_TRACE_CHAINS
+/**
+  Trace: slot, head and the job types of a chain (first 40 jobs), to see what a UMD submission really contains.
+**/
+static VOID
+TraceChain (ADAPTER *A, ULONG Slot, ULONGLONG Chain)
+{
+  ULONGLONG  Va = Chain;
+  ULONG      N, Cnt = 0;
+  CHAR       Types[160];
+  ULONG      Len = 0;
+
+  ExAcquireFastMutex (&A->CpuLock);
+  for (N = 0; (N < 200) && (Va != 0); N++) {
+    PUCHAR  H = GpuVaToCpu (A, Va, 0x40);
+
+    if (H == NULL) {
+      if (Len < sizeof (Types) - 8) { Types[Len++] = '?'; }
+      break;
+    }
+    if (Cnt < 40) {
+      ULONG  Ty = (H[0x10] >> 1) & 0x7F;
+      CONST CHAR  Tc[] = "0123456789abcdef";
+      Types[Len++] = (Ty < 16) ? Tc[Ty] : '+';
+      Types[Len++] = ',';
+    }
+    Cnt++;
+    Va = *(volatile ULONGLONG *)(H + 0x18);
+  }
+  ExReleaseFastMutex (&A->CpuLock);
+  Types[Len] = 0;
+  OsLog ("exynoswddm: chain slot %lu head 0x%08lx: %lu jobs [%s]", Slot, (ULONG)Chain, Cnt, Types);
+  if ((Cnt >= 100) && (A->ChainDetail++ < 3)) {
+    //
+    // Job header detail of the first 20 jobs: type byte, barrier/flags byte, job index, dependency 1 / 2.
+    //
+    ExAcquireFastMutex (&A->CpuLock);
+    Va = Chain;
+    for (N = 0; (N < 20) && (Va != 0); N++) {
+      PUCHAR  H = GpuVaToCpu (A, Va, 0x40);
+
+      if (H == NULL) {
+        break;
+      }
+      OsLog ("exynoswddm:    job %lu @%08lx: b10 %02x b11 %02x idx %u dep1 %u dep2 %u next %08lx exc %08lx", N, (ULONG)Va, H[0x10], H[0x11],
+             *(volatile USHORT *)(H + 0x12), *(volatile USHORT *)(H + 0x14), *(volatile USHORT *)(H + 0x16),
+             (ULONG)*(volatile ULONGLONG *)(H + 0x18), *(volatile ULONG *)(H + 0));
+      Va = *(volatile ULONGLONG *)(H + 0x18);
+    }
+    ExReleaseFastMutex (&A->CpuLock);
+  }
+}
+#endif  // EXW_TRACE_CHAINS
+
 static VOID
 ExecJob (ADAPTER *A, CONST EX_CMD_GPU_JOB_ARGS *J)
 {
@@ -645,6 +1413,12 @@ ExecJob (ADAPTER *A, CONST EX_CMD_GPU_JOB_ARGS *J)
     A->JobsFailed++;
     return;
   }
+#ifdef EXW_TRACE_CHAINS
+  if (A->ChainTraces++ < 1000000) {
+    TraceChain (A, J->Slot, J->Chain);
+  }
+#endif
+  __builtin_arm_dsb (15);                        // CPU writes (WC buffers) reach RAM before the GPU is kicked
   Status = A->Gpu.RunChain (A->Gpu.Header.Context, J->Slot, J->Chain, GPU_JOB_TIMEOUT_MS);
   A->LastJsStatus = Status;
   if (Status == 1) {
@@ -661,7 +1435,7 @@ ExecJob (ADAPTER *A, CONST EX_CMD_GPU_JOB_ARGS *J)
 }
 
 static VOID
-Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
+ExecuteCmds (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
 {
   ULONG  Offset = 0;
 
@@ -673,6 +1447,11 @@ Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
       return;
     }
     A->Commands++;
+    if ((C->Op != EX_CMD_GDI) && (C->Op != EX_CMD_NOP) && (gBatch.N != 0)) {
+      ExAcquireFastMutex (&A->CpuLock);   // GDI's pending draws before anything else touches memory
+      GdiBatchFlush (A);
+      ExReleaseFastMutex (&A->CpuLock);
+    }
     switch (C->Op) {
       case EX_CMD_NOP:
         break;
@@ -689,11 +1468,29 @@ Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
           ExecJob (A, (CONST EX_CMD_GPU_JOB_ARGS *)C);
         }
         break;
+      case EX_CMD_GDI:
+        if (C->Size >= FIELD_OFFSET (EX_CMD_GDI_ARGS, Rects)) {
+          ExAcquireFastMutex (&A->CpuLock);
+          ExecGdi (A, (CONST EX_CMD_GDI_ARGS *)C);
+          ExReleaseFastMutex (&A->CpuLock);
+        }
+        break;
       default:
         A->BadCommands++;
         break;
     }
     Offset += C->Size;
+  }
+}
+
+static VOID
+Execute (ADAPTER *A, PUCHAR Dma, ULONG Bytes)
+{
+  ExecuteCmds (A, Dma, Bytes);
+  if (gBatch.N != 0) {
+    ExAcquireFastMutex (&A->CpuLock);     // the DMA buffer (the batch's commands) is only valid until we return
+    GdiBatchFlush (A);
+    ExReleaseFastMutex (&A->CpuLock);
   }
 }
 
@@ -715,14 +1512,28 @@ ExecFlip (ADAPTER *A, EX_ALLOCATION *X, ULONGLONG PrimaryAddress)
   if (X->GpuPresented && (A->ScanGpuVa != 0)) {
     //
     // The UMD's GPU blit has put the frame into the off-screen scan-out
-    // buffer (and waited for it): show that one, no copy.  Once the vsync
-    // has latched it, the blit target moves to the other buffer - before
-    // the next job, the next blit, runs (this worker runs them in order).
+    // buffer (and waited for it): show that one, no copy.  Three buffers:
+    // on screen, this one (pending until the next vsync latches it) and a
+    // free one - the blit target moves there at once, so the worker (and
+    // with it every GPU job) does not wait for the vsync.  Only a flip that
+    // finds the previous one still pending waits for it to latch first.
     //
     ULONG          Shown = A->ScanGpuBack;
+    ULONG          Front;
+    ULONG          Next;
     ULONG          Waited;
     LARGE_INTEGER  Ms;
 
+    Ms.QuadPart = -10000;                           // 1 ms
+    for (Waited = 0; A->FlipPending && (Waited < 50); Waited++) {
+      KeDelayExecutionThread (KernelMode, FALSE, &Ms);
+    }
+    if (Waited != 0) {
+      A->FlipWaits++;
+    }
+    if (A->FlipPending) {
+      A->FlipWaitTimeouts++;                        // the previous flip never latched: this one replaces it
+    }
     A->ScanAlloc      = X;
     A->ScanAllocBuf   = Shown;
     A->PendingPrimary = PrimaryAddress;
@@ -730,16 +1541,11 @@ ExecFlip (ADAPTER *A, EX_ALLOCATION *X, ULONGLONG PrimaryAddress)
     A->Flips++;
     A->GpuFlips++;
     ArmVsync (A, A->ScanBuf[Shown].Pa.LowPart);
-    Ms.QuadPart = -10000;                           // 1 ms
-    for (Waited = 0; A->FlipPending && (Waited < 50); Waited++) {
-      KeDelayExecutionThread (KernelMode, FALSE, &Ms);
+    Front = A->ScanFront;                           // read after arming: if Shown latched already, Front = Shown
+    for (Next = 0; (Next == Shown) || (Next == Front); Next++) {
     }
-    if (A->FlipPending) {
-      A->FlipWaitTimeouts++;                        // not latched (yet): keep writing the same buffer
-      return;
-    }
-    if (NT_SUCCESS (ScanoutMapTo (A, A->ScanGpuVa, Shown ^ 1))) {
-      A->ScanGpuBack = Shown ^ 1;
+    if ((Next < SCAN_BUFS) && NT_SUCCESS (ScanoutMapTo (A, A->ScanGpuVa, Next))) {
+      A->ScanGpuBack = Next;
     }
     return;
   }
@@ -812,13 +1618,47 @@ Worker (PVOID Context)
   for (;;) {
     if (KeWaitForSingleObject (&A->QueueEvent, Executive, KernelMode, FALSE, &Beat) == STATUS_TIMEOUT) {
       ULONG  Now = A->Presents + A->Submissions + A->Renders + A->Flips + A->AllocCount;
+      static ULONG  VsyncsSeen;
 
+      if (A->Vsyncs != VsyncsSeen) {
+        OsLog ("exynoswddm: [5 s] vsyncs %lu (+%lu), to windows %lu, flip pending %lu, panel %u, interrupt on/off calls %lu/%lu",
+               A->Vsyncs, A->Vsyncs - VsyncsSeen, A->VsyncToWindows, A->FlipPending, A->PanelOn, A->VsyncOnCalls,
+               A->VsyncOffCalls);
+        VsyncsSeen = A->Vsyncs;
+      }
       if (Now != Seen) {
         Seen = Now;
-        OsLog ("exynoswddm: [5 s] presents %lu (blt %lu fill %lu), submissions %lu, renders %lu, flips %lu (%lu no-copy, %lu unlatched), allocations %lu, "
+        OsLog ("exynoswddm: [5 s] presents %lu (blt %lu fill %lu), submissions %lu, renders %lu, flips %lu (%lu no-copy, %lu waited, %lu unlatched), allocations %lu, "
                "fence %lu/%lu, jobs %lu (%lu failed), maps %lu (%lu failed), bad %lu", A->Presents, A->PresentBlts,
-               A->PresentFills, A->Submissions, A->Renders, A->Flips, A->GpuFlips, A->FlipWaitTimeouts, A->AllocCount, A->LastCompleted, A->LastSubmitted,
+               A->PresentFills, A->Submissions, A->Renders, A->Flips, A->GpuFlips, A->FlipWaits, A->FlipWaitTimeouts, A->AllocCount, A->LastCompleted, A->LastSubmitted,
                A->JobsDone, A->JobsFailed, A->Maps, A->MapFails, A->BadCommands);
+        if (A->GdiRenders != 0) {
+          OsLog ("exynoswddm: [5 s] GDI: renderkm %lu, commands %lu (bad %lu), executed blt %lu fill %lu alpha %lu stretch %lu "
+                 "transparent %lu cleartype %lu, skipped %lu", A->GdiRenders, A->GdiCommands, A->GdiBadCmds, A->GdiOps[1],
+                 A->GdiOps[2], A->GdiOps[3], A->GdiOps[4], A->GdiOps[6], A->GdiOps[7], A->GdiSkips);
+          {
+            LARGE_INTEGER  F;
+
+            KeQueryPerformanceCounter (&F);
+            OsLog ("exynoswddm: [5 s] GDI GPU: %s, passes %lu (failed %lu, batched commands %lu), GPU %lu k pixels in %lu ms; CPU fill+copy %lu k in %lu ms",
+                   A->GdiGpuOk ? "on" : "off", A->GdiGpuPasses, A->GdiGpuFails, A->GdiGpuDraws, (ULONG)(A->GdiGpuPixels / 1000),
+                   (ULONG)(A->GdiGpuTicks * 1000 / max (F.QuadPart, 1)), (ULONG)(A->GdiCpuPixels / 1000),
+                   (ULONG)(A->GdiCpuTicks * 1000 / max (F.QuadPart, 1)));
+            OsLog ("exynoswddm: [5 s] present blts on the GPU: %lu, %lu k pixels in %lu ms", A->PresentGpuBlts,
+                   (ULONG)(A->PresentGpuPixels / 1000), (ULONG)(A->PresentGpuTicks * 1000 / max (F.QuadPart, 1)));
+            OsLog ("exynoswddm: [5 s] GDI scroll (copy within a surface): GPU %lu k pixels in %lu ms, CPU %lu k in %lu ms",
+                   (ULONG)(A->GdiSelfPixels / 1000), (ULONG)(A->GdiSelfTicks * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiSelfCpuPixels / 1000), (ULONG)(A->GdiSelfCpuTicks * 1000 / max (F.QuadPart, 1)));
+            OsLog ("exynoswddm: [5 s] GDI CPU other: alpha %lu k / %lu ms, stretch %lu k / %lu ms, transparent %lu k / %lu ms, "
+                   "cleartype %lu k / %lu ms, rop blt %lu k / %lu ms, rop fill %lu k / %lu ms",
+                   (ULONG)(A->GdiOpPixels[3] / 1000), (ULONG)(A->GdiOpTicks[3] * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiOpPixels[4] / 1000), (ULONG)(A->GdiOpTicks[4] * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiOpPixels[6] / 1000), (ULONG)(A->GdiOpTicks[6] * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiOpPixels[7] / 1000), (ULONG)(A->GdiOpTicks[7] * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiOpPixels[1] / 1000), (ULONG)(A->GdiOpTicks[1] * 1000 / max (F.QuadPart, 1)),
+                   (ULONG)(A->GdiOpPixels[2] / 1000), (ULONG)(A->GdiOpTicks[2] * 1000 / max (F.QuadPart, 1)));
+          }
+        }
       }
       continue;
     }
@@ -915,7 +1755,7 @@ RenderStart (ADAPTER *A)
       return STATUS_INSUFFICIENT_RESOURCES;
     }
     A->CarvePa.QuadPart = GPU_CARVEOUT_BASE + CARVEOUT_SKIP;
-    A->CarveBytes       = 2 * (ULONG)FB_BYTES;
+    A->CarveBytes       = SCAN_BUFS * (ULONG)FB_BYTES;
     A->CarveVa          = MmMapIoSpace (A->CarvePa, A->CarveBytes, MmWriteCombined);
     if (A->CarveVa == NULL) {
       return STATUS_INSUFFICIENT_RESOURCES;
@@ -924,8 +1764,12 @@ RenderStart (ADAPTER *A)
     A->ScanBuf[0].Pa          = A->CarvePa;
     A->ScanBuf[1].Va          = A->CarveVa + FB_BYTES;
     A->ScanBuf[1].Pa.QuadPart = A->CarvePa.QuadPart + FB_BYTES;
+    A->ScanBuf[2].Va          = A->CarveVa + 2 * FB_BYTES;
+    A->ScanBuf[2].Pa.QuadPart = A->CarvePa.QuadPart + 2 * FB_BYTES;
+    C_ASSERT (CARVEOUT_SKIP + SCAN_BUFS * (ULONGLONG)WIDTH * HEIGHT * 4 <= GPU_CARVEOUT_SIZE);
     RtlCopyMemory (A->ScanBuf[0].Va, A->Boot.Va, FB_BYTES);
     RtlCopyMemory (A->ScanBuf[1].Va, A->Boot.Va, FB_BYTES);
+    RtlCopyMemory (A->ScanBuf[2].Va, A->Boot.Va, FB_BYTES);
   }
   if (A->VaBits == NULL) {
     A->VaBits = ExAllocatePoolWithTag (NonPagedPool, (VA_GRANULES + 31) / 32 * 4, TAG_VA);
@@ -934,6 +1778,7 @@ RenderStart (ADAPTER *A)
     }
     RtlInitializeBitMap (&A->VaMap, A->VaBits, VA_GRANULES);
     RtlClearAllBits (&A->VaMap);
+    GdiGpuReserveVa (A);                  // GDI render passes: fixed GPU addresses (gdigpu_layout.h)
     KeInitializeSpinLock (&A->AllocLock);
     InitializeListHead (&A->Allocs);
     ExInitializeFastMutex (&A->VaLock);
@@ -942,8 +1787,8 @@ RenderStart (ADAPTER *A)
     ExInitializeFastMutex (&A->ScanMapLock);
   }
   OsLog ("exynoswddm: aperture segment %lu MiB (nominal 0x%08lx), GPU addresses 0x%08lx..0x%08lx, scan-out buffers "
-         "0x%08lx / 0x%08lx, %s", (ULONG)(APERTURE_BYTES >> 20), (ULONG)APERTURE_BASE, (ULONG)EX_GPU_VA_START,
-         (ULONG)EX_GPU_VA_END, A->ScanBuf[0].Pa.LowPart, A->ScanBuf[1].Pa.LowPart,
+         "0x%08lx .. 0x%08lx (3), %s", (ULONG)(APERTURE_BYTES >> 20), (ULONG)APERTURE_BASE, (ULONG)EX_GPU_VA_START,
+         (ULONG)EX_GPU_VA_END, A->ScanBuf[0].Pa.LowPart, A->ScanBuf[2].Pa.LowPart,
          EXW_GPU_MODE ? "GPU mode" : "present-only mode (UMD renders on the CPU)");
 
   KeInitializeSpinLock (&A->QueueLock);
@@ -981,6 +1826,7 @@ RenderStop (ADAPTER *A)
 VOID
 RenderRelease (ADAPTER *A)
 {
+  GdiGpuRelease (A);
   if ((A->ScanGpuVa != 0) && A->GpuOk) {
     A->Gpu.UnmapPages (A->Gpu.Header.Context, A->ScanGpuVa, (ULONG)(FB_BYTES >> PAGE_SHIFT));
   }
@@ -1080,6 +1926,8 @@ RnDestroyContext (IN_CONST_HANDLE hContext)
 // ---------------------------------------------------------------------------
 //
 
+static ULONG  mGdiSurfLogs;
+
 static NTSTATUS APIENTRY
 RnGetStandardAllocationDriverData (IN_CONST_HANDLE hAdapter,
                                    INOUT_PDXGKARG_GETSTANDARDALLOCATIONDRIVERDATA pData)
@@ -1110,12 +1958,49 @@ RnGetStandardAllocationDriverData (IN_CONST_HANDLE hAdapter,
       I.Format = D3DDDIFMT_A8R8G8B8;
       pData->pCreateStagingSurfaceData->Pitch = SurfacePitch (I.Width);
       break;
+    case D3DKMDT_STANDARDALLOCATION_GDISURFACE: {
+      D3DKMDT_GDISURFACEDATA  *G = pData->pCreateGdiSurfaceData;
+
+      if (!gGdiAccel || (G == NULL)) {
+        return STATUS_NOT_SUPPORTED;
+      }
+      switch (G->Format) {
+        case D3DDDIFMT_A8R8G8B8:
+        case D3DDDIFMT_X8R8G8B8:
+        case D3DDDIFMT_A8B8G8R8:
+        case D3DDDIFMT_X8B8G8R8:
+        case D3DDDIFMT_A8:
+          break;
+        default:
+          RLOG ("exynoswddm: GDI surface format %u not supported", (ULONG)G->Format);
+          return STATUS_NOT_SUPPORTED;
+      }
+      if ((G->Type == D3DKMDT_GDISURFACE_INVALID) || (G->Type > D3DKMDT_GDISURFACE_TEXTURE_CROSSADAPTER) ||
+          (G->Type == D3DKMDT_GDISURFACE_TEXTURE_CPUVISIBLE) || (G->Width == 0) || (G->Height == 0) ||
+          (G->Width > 8192) || (G->Height > 8192)) {
+        RLOG ("exynoswddm: GDI surface type %u %ux%u not supported", (ULONG)G->Type, G->Width, G->Height);
+        return STATUS_NOT_SUPPORTED;
+      }
+      I.Flags |= EXMW_ALLOC_KM_GDI | EXMW_ALLOC_KM_GDITYPE_SET (G->Type);
+      I.Width  = G->Width;
+      I.Height = G->Height;
+      I.Format = G->Format;
+      I.Pitch  = GdiPitch (G->Width, G->Format);
+      I.Size   = (UINT64)I.Pitch * I.Height;
+      G->Pitch = I.Pitch;           // required for CPU-visible types, harmless for the others
+      if (mGdiSurfLogs++ < 40) {
+        RLOG ("exynoswddm: GDI surface type %u format %u %ux%u pitch %u", (ULONG)G->Type, (ULONG)G->Format,
+              G->Width, G->Height, I.Pitch);
+      }
+      goto Done;
+    }
     default:
       RLOG ("exynoswddm: standard allocation type %u not supported", (ULONG)pData->StandardAllocationType);
       return STATUS_NOT_SUPPORTED;
   }
   I.Pitch = SurfacePitch (I.Width);
   I.Size  = (UINT64)I.Pitch * I.Height;
+Done:
   pData->ResourcePrivateDriverDataSize = 0;
   if (pData->pAllocationPrivateDriverData == NULL) {
     pData->AllocationPrivateDriverDataSize = sizeof (I);
@@ -1269,6 +2154,19 @@ RnCreateAllocation (IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_CREATEALLOCATION pC
     I->pAllocationUsageHint        = NULL;
     I->Flags.Value                 = 0;
     I->Flags.CpuVisible            = 1;
+    if (In->Flags & EXMW_ALLOC_KM_GDI) {
+      X->GdiType = (UCHAR)EXMW_ALLOC_KM_GDITYPE (In->Flags);
+      X->Bpp     = (UCHAR)FormatBpp (In->Format);
+      if (X->GdiType == D3DKMDT_GDISURFACE_EXISTINGSYSMEM) {
+        //
+        // win32k's own (cached) bits become the backing store; VidMm keeps
+        // them coherent for the GPU (Cached), the KMD maps them cached.
+        //
+        I->Flags.ExistingSysMem = 1;
+        I->Flags.Cached         = 1;
+        X->CpuCached            = TRUE;
+      }
+    }
     I->AllocationPriority          = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
     if ((A->AllocCount <= 8) || (In->Flags & EXMW_ALLOC_PRIMARY)) {
       RLOG ("exynoswddm: CreateAllocation %p flags 0x%x %ux%u pitch %u, %lu pages at GPU 0x%08lx", X, In->Flags,
@@ -1509,6 +2407,227 @@ RnRender (IN_CONST_HANDLE hContext, INOUT_PDXGKARG_RENDER pRender)
   pointers straight from the allocation list), Flip: nothing to copy here
   (SetVidPnSourceAddress queues the flip copy).
 **/
+
+/**
+  GDI hardware acceleration: CDD's DXGK_RENDERKM_COMMAND list -> EX_CMD_GDI
+  commands (executed by the worker, ExecGdi).  A command with more
+  sub-rectangles than fit becomes several; when the DMA buffer is full the
+  rest continues in the next one (MultipassOffset: high 16 bits = byte
+  offset / 4 of the command, low 16 bits = its sub-rectangles done).
+**/
+static EX_ALLOCATION *
+GdiAlloc (CONST DXGKARG_RENDER *R, UINT Index)
+{
+  if (Index >= R->AllocationListSize) {
+    return NULL;
+  }
+  return (EX_ALLOCATION *)R->pAllocationList[Index].hDeviceSpecificAllocation;
+}
+
+static NTSTATUS APIENTRY
+RnRenderKm (IN_CONST_HANDLE hContext, INOUT_PDXGKARG_RENDER pRender)
+{
+  ADAPTER        *A = AdapterOf (hContext);
+  CONST UCHAR    *Cmd = (CONST UCHAR *)pRender->pCommand;
+  ULONG          Len = pRender->CommandLength;
+  PUCHAR         Out = (PUCHAR)pRender->pDmaBuffer;
+  PUCHAR         Start = Out;
+  PUCHAR         End = Out + pRender->DmaSize;
+  ULONG          Offset = (pRender->MultipassOffset >> 16) << 2;
+  ULONG          SubDone = pRender->MultipassOffset & 0xFFFF;
+  NTSTATUS       Status = STATUS_SUCCESS;
+  ULONG          N;
+  CONST ULONG    Head = FIELD_OFFSET (DXGK_RENDERKM_COMMAND, Command);
+
+  //
+  // Residency: one patch location per allocation-list entry (see RnRender).
+  //
+  for (N = 0; (N < pRender->AllocationListSize) && (N < pRender->PatchLocationListOutSize); N++) {
+    D3DDDI_PATCHLOCATIONLIST  *P = &pRender->pPatchLocationListOut[N];
+
+    RtlZeroMemory (P, sizeof (*P));
+    P->AllocationIndex = N;
+    P->SlotId          = N;
+  }
+  pRender->pPatchLocationListOut += N;
+
+  while ((Cmd != NULL) && (Offset + Head <= Len)) {
+    CONST DXGK_RENDERKM_COMMAND  *K = (CONST DXGK_RENDERKM_COMMAND *)(Cmd + Offset);
+    EX_CMD_GDI_ARGS              T;
+    CONST RECT                   *Sub = NULL;
+    ULONG                        Total;
+    BOOLEAN                      Ok = TRUE;
+
+    if ((K->CommandSize < Head) || (K->CommandSize > Len - Offset) || ((Offset & 3) != 0)) {
+      if (A->GdiBadCmds++ < 10) {
+        RLOG ("exynoswddm: RenderKm: bad command at %lu (op %u, size %u, buffer %lu)", Offset, (ULONG)K->OpCode,
+              K->CommandSize, Len);
+      }
+      Status = STATUS_INVALID_PARAMETER;
+      break;
+    }
+    RtlZeroMemory (&T, sizeof (T));
+    T.Hdr.Op = EX_CMD_GDI;
+    T.GdiOp  = (UINT32)K->OpCode;
+    switch (K->OpCode) {
+      case DXGK_GDIOP_BITBLT: {
+        CONST DXGK_GDIARG_BITBLT  *B = &K->Command.BitBlt;
+
+        T.Dst      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->DstAllocationIndex);
+        T.Src      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->SrcAllocationIndex);
+        T.SrcRect  = *(CONST EX_RECT *)&B->SrcRect;
+        T.DstRect  = *(CONST EX_RECT *)&B->DstRect;
+        T.Rop      = B->Rop;
+        T.Rop3     = B->Rop3;
+        T.SrcPitch = B->SrcPitch;
+        T.DstPitch = B->DstPitch;
+        Total      = B->NumSubRects;
+        Sub        = B->pSubRects;
+        Ok         = (T.Src != 0);
+        break;
+      }
+      case DXGK_GDIOP_COLORFILL: {
+        CONST DXGK_GDIARG_COLORFILL  *F = &K->Command.ColorFill;
+
+        T.Dst     = (UINT64)(ULONG_PTR)GdiAlloc (pRender, F->DstAllocationIndex);
+        T.DstRect = *(CONST EX_RECT *)&F->DstRect;
+        T.Color   = F->Color;
+        T.Rop     = F->Rop;
+        T.Rop3    = F->Rop3;
+        Total     = F->NumSubRects;
+        Sub       = F->pSubRects;
+        break;
+      }
+      case DXGK_GDIOP_ALPHABLEND: {
+        CONST DXGK_GDIARG_ALPHABLEND  *B = &K->Command.AlphaBlend;
+
+        T.Dst           = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->DstAllocationIndex);
+        T.Src           = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->SrcAllocationIndex);
+        T.SrcRect       = *(CONST EX_RECT *)&B->SrcRect;
+        T.DstRect       = *(CONST EX_RECT *)&B->DstRect;
+        T.ConstantAlpha = B->SourceConstantAlpha;
+        T.Flags         = B->SourceHasAlpha ? EX_GDI_F_HASALPHA : 0;
+        T.SrcPitch      = B->SrcPitch;
+        Total           = B->NumSubRects;
+        Sub             = B->pSubRects;
+        Ok              = (T.Src != 0);
+        break;
+      }
+      case DXGK_GDIOP_STRETCHBLT: {
+        CONST DXGK_GDIARG_STRETCHBLT  *B = &K->Command.StretchBlt;
+
+        T.Dst      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->DstAllocationIndex);
+        T.Src      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->SrcAllocationIndex);
+        T.SrcRect  = *(CONST EX_RECT *)&B->SrcRect;
+        T.DstRect  = *(CONST EX_RECT *)&B->DstRect;
+        T.Rop      = B->Mode;
+        T.Flags    = (B->MirrorX ? EX_GDI_F_MIRRORX : 0) | (B->MirrorY ? EX_GDI_F_MIRRORY : 0);
+        T.SrcPitch = B->SrcPitch;
+        Total      = B->NumSubRects;
+        Sub        = B->pSubRects;
+        Ok         = (T.Src != 0);
+        break;
+      }
+      case DXGK_GDIOP_TRANSPARENTBLT: {
+        CONST DXGK_GDIARG_TRANSPARENTBLT  *B = &K->Command.TransparentBlt;
+
+        T.Dst      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->DstAllocationIndex);
+        T.Src      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->SrcAllocationIndex);
+        T.SrcRect  = *(CONST EX_RECT *)&B->SrcRect;
+        T.DstRect  = *(CONST EX_RECT *)&B->DstRect;
+        T.Color    = B->Color;
+        T.Flags    = B->Flags.HonorAlpha ? EX_GDI_F_HONORALPHA : 0;
+        T.SrcPitch = B->SrcPitch;
+        Total      = B->NumSubRects;
+        Sub        = B->pSubRects;
+        Ok         = (T.Src != 0);
+        break;
+      }
+      case DXGK_GDIOP_CLEARTYPEBLEND: {
+        CONST DXGK_GDIARG_CLEARTYPEBLEND  *B = &K->Command.ClearTypeBlend;
+
+        T.Dst        = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->DstAllocationIndex);
+        T.Alpha      = (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->AlphaSurfAllocationIndex);
+        T.Gamma      = (B->Gamma == D3DKM_INVALID_GAMMA_INDEX) ? 0 :
+                       (UINT64)(ULONG_PTR)GdiAlloc (pRender, B->GammaSurfAllocationIndex);
+        T.DstRect    = *(CONST EX_RECT *)&B->DstRect;
+        T.OffsetX    = B->DstToAlphaOffsetX;
+        T.OffsetY    = B->DstToAlphaOffsetY;
+        T.Color      = B->Color;
+        T.Color2     = B->Color2;
+        T.GammaIndex = B->Gamma;
+        T.SrcPitch   = B->AlphaSurfPitch;
+        Total        = B->NumSubRects;
+        Sub          = B->pSubRects;
+        Ok           = (T.Alpha != 0);
+        break;
+      }
+      case DXGK_GDIOP_ESCAPE:
+        Ok = FALSE;                 // "the driver ignores this command"
+        Total = 0;
+        break;
+      default:
+        if (A->GdiBadCmds++ < 10) {
+          RLOG ("exynoswddm: RenderKm: unknown op %u", (ULONG)K->OpCode);
+        }
+        Ok = FALSE;
+        Total = 0;
+        break;
+    }
+    if (Ok && (T.Dst == 0)) {
+      Ok = FALSE;
+    }
+    if (Ok && (Total != 0) && (Sub == NULL)) {
+      Ok = FALSE;
+    }
+    if (!Ok && (K->OpCode != DXGK_GDIOP_ESCAPE) && (A->GdiBadCmds++ < 10)) {
+      RLOG ("exynoswddm: RenderKm: op %u dropped (dst %p src %p alpha %p, %lu sub-rectangles %p)", (ULONG)K->OpCode,
+            (PVOID)(ULONG_PTR)T.Dst, (PVOID)(ULONG_PTR)T.Src, (PVOID)(ULONG_PTR)T.Alpha, Total, Sub);
+    }
+    if (Ok) {
+      ULONG  Rects = (Total != 0) ? min (Total, 0xFFFFu) : 1;
+
+      while (SubDone < Rects) {
+        ULONG             Room = (End > Out) ? (ULONG)(End - Out) : 0;
+        ULONG             Fit;
+        ULONG             Need;
+        EX_CMD_GDI_ARGS   *G = (EX_CMD_GDI_ARGS *)Out;
+        ULONG             I;
+
+        Fit = min (Rects - SubDone, (ULONG)EX_GDI_MAX_RECTS);
+        while ((Fit > 0) && (((FIELD_OFFSET (EX_CMD_GDI_ARGS, Rects) + Fit * sizeof (EX_RECT) + 7) & ~7u) > Room)) {
+          Fit--;
+        }
+        if (Fit == 0) {
+          pRender->MultipassOffset = ((Offset >> 2) << 16) | SubDone;
+          Status = STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+          goto Exit;
+        }
+        Need = (FIELD_OFFSET (EX_CMD_GDI_ARGS, Rects) + Fit * sizeof (EX_RECT) + 7) & ~7u;
+        RtlCopyMemory (G, &T, FIELD_OFFSET (EX_CMD_GDI_ARGS, Rects));
+        G->Hdr.Size  = Need;
+        G->RectCount = Fit;
+        for (I = 0; I < Fit; I++) {
+          G->Rects[I] = (Total != 0) ? *(CONST EX_RECT *)&Sub[SubDone + I] : T.DstRect;
+        }
+        Out     += Need;
+        SubDone += Fit;
+      }
+      A->GdiCommands++;
+    }
+    SubDone = 0;
+    Offset += K->CommandSize;
+  }
+  pRender->MultipassOffset = 0;
+Exit:
+  pRender->pDmaBuffer = Out;
+  if ((A->GdiRenders++ < 3) || ((A->GdiRenders % 1000) == 0)) {
+    RLOG ("exynoswddm: RenderKm %lu: %lu command bytes, %lu allocations, %lu DMA bytes - 0x%08lx", A->GdiRenders, Len,
+          (ULONG)pRender->AllocationListSize, (ULONG)(Out - Start), (ULONG)Status);
+  }
+  return Status;
+}
+
 static NTSTATUS APIENTRY
 RnPresent (IN_CONST_HANDLE hContext, INOUT_PDXGKARG_PRESENT pPresent)
 {
@@ -2013,7 +3132,15 @@ RnEscape (IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pEscape)
       if (Size < sizeof (*C)) {
         return STATUS_BUFFER_TOO_SMALL;
       }
-      C->Flags = 0;
+      //
+      // Deferred present: the worker runs every DMA buffer in queue order and
+      // each GPU job to completion, so a present (blt) always comes after the
+      // app's earlier submissions - the UMD need not wait for the GPU first.
+      //
+      // Redirected present: DxgkDdiPresent's blt (back buffer -> DWM's redirection surface, on the GPU) is what DWM
+      // composes - checked 2026-11-10 with d3ddemo (69 FPS vs 29 with the UMD's GDI fallback).
+      //
+      C->Flags = EXMW_CAPS_DEFERRED_PRESENT | EXMW_CAPS_REDIRECTED_PRESENT;
       return STATUS_SUCCESS;
     }
     case EXW_ESCAPE_SHARED_PUBLISH:
@@ -2239,6 +3366,9 @@ RenderInitData (DRIVER_INITIALIZATION_DATA *Init)
   Init->DxgkDdiReleaseSwizzlingRange             = RnReleaseSwizzlingRange;
   Init->DxgkDdiBuildPagingBuffer                 = RnBuildPagingBuffer;
   Init->DxgkDdiRender                            = RnRender;
+  if (gGdiAccel) {
+    Init->DxgkDdiRenderKm                        = RnRenderKm;
+  }
   Init->DxgkDdiPresent                           = RnPresent;
   Init->DxgkDdiPatch                             = RnPatch;
   Init->DxgkDdiSubmitCommand                     = RnSubmitCommand;

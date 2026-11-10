@@ -27,6 +27,10 @@
 #define EXMW_ALLOC_NOEXEC       0x1     // not shader code
 #define EXMW_ALLOC_PRIMARY      0x2     // scan-out capable
 #define EXMW_ALLOC_CPU_ONDEMAND 0x4     // (WDDM 2 hint; ignored here)
+// Kernel-only (standard allocations the KMD describes itself; the UMD never sets these):
+#define EXMW_ALLOC_KM_GDI       0x100   // a GDI surface (D3DKMDT_STANDARDALLOCATION_GDISURFACE)
+#define EXMW_ALLOC_KM_GDITYPE(f) (((f) >> 12) & 0xF)   // its D3DKMDT_GDISURFACETYPE
+#define EXMW_ALLOC_KM_GDITYPE_SET(t) (((UINT32)(t) & 0xF) << 12)
 
 #pragma pack (push, 8)
 
@@ -158,6 +162,8 @@ typedef struct {
 } EXMW_ESCAPE_SCANOUT_DATA;
 
 #define EXMW_CAPS_DEFERRED_PRESENT 0x1u
+#define EXMW_CAPS_REDIRECTED_PRESENT 0x2u     // windowed (DWM-redirected) presents through the runtime reach DWM:
+                                               // the UMD needs no GDI fallback
 typedef struct {
   UINT32  Code;
   UINT32  Flags;                        // out: EXMW_CAPS_*
